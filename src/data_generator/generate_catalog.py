@@ -14,6 +14,7 @@ import json
 import random
 import uuid
 from datetime import datetime, date
+from datetime import timezone
 from pathlib import Path
 
 from faker import Faker
@@ -93,7 +94,7 @@ def generate_label_catalog(label_name: str, n_artists: int = 10) -> dict:
 
     return {
         "label":      label_name,
-        "generated":  datetime.utcnow().isoformat(),
+        "generated":  datetime.now(timezone.utc).isoformat(),
         "stats": {
             "artists": len(artists),
             "albums":  len(albums),
