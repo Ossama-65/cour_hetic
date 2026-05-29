@@ -1,0 +1,12 @@
+# Template pour les issues GitHub SPOTIFY
+# Copier-coller pour chaque nouvelle issue
+
+name: "Livrable projet"
+about: "Template standard pour les livrables du projet SPOTIFY"
+labels: ["livrable"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Utilisez ce template pour toutes les issues livrables.
+        Chaque issue = un livrable vérifiable.
