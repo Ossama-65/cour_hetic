@@ -57,14 +57,31 @@ EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]  # pondéré : 60% P2P
 # DONNÉES SIMULÉES
 # ─────────────────────────────────────────────────────────────
 
-SAMPLE_TRACKS = [
-    {"id": str(uuid.uuid4()), "title": f"Track {i}", "duration_ms": random.randint(120000, 300000)}
-    for i in range(50)
-]
+def _load_catalog_from_db():
+    """Charge les vrais tracks et users depuis PostgreSQL."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host="localhost", port=5432,
+            dbname="spotify", user="spotify", password="spotify"
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT id::text, title, duration_ms FROM tracks LIMIT 200")
+        tracks = [{"id": r[0], "title": r[1], "duration_ms": r[2]} for r in cur.fetchall()]
+        conn.close()
+        if tracks:
+            print(f"✅ {len(tracks)} tracks chargées depuis PostgreSQL")
+            return tracks
+    except Exception as e:
+        print(f"⚠️  PostgreSQL indisponible, utilisation des données fictives : {e}")
+    return [
+        {"id": str(uuid.uuid4()), "title": f"Track {i}", "duration_ms": random.randint(120000, 300000)}
+        for i in range(50)
+    ]
 
-SAMPLE_USERS = [str(uuid.uuid4()) for _ in range(200)]
-SAMPLE_PEERS = [str(uuid.uuid4()) for _ in range(20)]
-
+SAMPLE_TRACKS = _load_catalog_from_db()
+SAMPLE_USERS  = [str(uuid.uuid4()) for _ in range(200)]
+SAMPLE_PEERS  = [str(uuid.uuid4()) for _ in range(20)]
 
 # ─────────────────────────────────────────────────────────────
 # SIMULATEUR PRINCIPAL
@@ -195,7 +212,12 @@ class P2PSimulator:
 
     def _publish_to_redis(self, channel: str, payload: str):
         try:
+            # Pub/sub (temps réel)
             self.redis.publish(channel, payload)
+            # Liste buffer (pour le DAG Airflow)
+            self.redis.lpush(f"{channel}:buffer", payload)
+            # Garder max 10 000 events dans le buffer
+            self.redis.ltrim(f"{channel}:buffer", 0, 9999)
         except Exception as e:
             logger.error(f"Erreur Redis publish sur '{channel}': {e}")
 

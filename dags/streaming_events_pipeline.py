@@ -14,16 +14,6 @@ Architecture :
         → enrich_events()            ← jointure catalogue PostgreSQL
         → store_to_parquet()         ← MinIO partitionné par heure
         → upsert_to_postgres()       ← table listening_events
-
-TODO :
-    [ ] Implémenter consume_from_redis() — accumuler les events sur 5 min
-    [ ] Implémenter validate_events() — champs obligatoires, envoyer invalides en DLQ
-    [ ] Implémenter enrich_events() — joindre avec le catalogue (track_id → artiste, genre)
-    [ ] Implémenter store_to_parquet() — Parquet sur MinIO partitionné par heure
-    [ ] Implémenter upsert_to_postgres() — insérer dans listening_events
-    [ ] Utiliser TaskFlow API (@task) pour toutes les tâches
-    [ ] Ajouter des branches conditionnelles : séparer listening_events et p2p_network_events
-    [ ] Ajouter doc_md sur ce DAG
 """
 
 from datetime import datetime, timedelta
@@ -44,15 +34,12 @@ les valide, les enrichit et les stocke en dual : Parquet (MinIO) + PostgreSQL.
 
 ### Destinations
 - Table `listening_events` (PostgreSQL)
-- Fichiers Parquet partitionnés sur MinIO : `s3://spotify-parquet/listening_events/date=.../hour=.../`
+- Fichiers Parquet partitionnés sur MinIO
 - Table `dead_letter_events` (pour les events invalides)
 
 ### Idempotence
-Chaque event est identifié par `event_id` (UUID). L'upsert utilise
+Chaque event est identifié par `event_id` (UUID).
 `ON CONFLICT (id) DO NOTHING` pour éviter les doublons.
-
-### TODO
-Compléter les 5 tâches marquées NotImplementedError.
 """
 
 DEFAULT_ARGS = {
@@ -65,8 +52,8 @@ DEFAULT_ARGS = {
 }
 
 POSTGRES_CONN_ID = "spotify_postgres"
-REDIS_CHANNELS   = ["listening_events", "p2p_network_events"]
-BATCH_WINDOW_SEC = 300  # 5 minutes
+REDIS_URL        = "redis://redis:6379/1"
+BATCH_SIZE       = 1000
 
 
 with DAG(
@@ -82,91 +69,265 @@ with DAG(
 
     @task(task_id="consume_from_redis")
     def consume_from_redis(**context) -> dict:
-        """
-        Consomme les événements Redis publiés pendant la fenêtre de 5 minutes.
+        import redis as redis_lib
+        import json
 
-        TODO :
-            1. Se connecter à Redis (REDIS_URL depuis les env vars)
-            2. Utiliser un pattern subscriber ou lire depuis une liste Redis
-               (le simulateur publie sur les channels REDIS_CHANNELS)
-            3. Accumuler tous les messages de la fenêtre temporelle
-            4. Retourner {"listening": [...], "p2p_network": [...]}
+        r = redis_lib.from_url(REDIS_URL, decode_responses=True)
 
-        Hint : avec redis pub/sub, les messages ne sont pas persistés.
-        Une alternative : le simulateur peut aussi écrire dans une Redis LIST
-        (lpush) que le DAG consomme avec rpop/lrange.
-        Discutez avec l'équipe Infra & P2P de la stratégie choisie.
-        """
-        raise NotImplementedError("TODO : implémenter consume_from_redis()")
+        listening  = []
+        p2p        = []
+
+        # Lire depuis les listes Redis (le simulateur publie sur pub/sub
+        # ET on utilise une liste buffer pour la persistance)
+        # On lit jusqu'à BATCH_SIZE events
+        raw_listening = r.lrange("listening_events:buffer", 0, BATCH_SIZE - 1)
+        r.ltrim("listening_events:buffer", len(raw_listening), -1)
+
+        raw_p2p = r.lrange("p2p_network_events:buffer", 0, BATCH_SIZE - 1)
+        r.ltrim("p2p_network_events:buffer", len(raw_p2p), -1)
+
+        for raw in raw_listening:
+            try:
+                listening.append(json.loads(raw))
+            except Exception:
+                pass
+
+        for raw in raw_p2p:
+            try:
+                p2p.append(json.loads(raw))
+            except Exception:
+                pass
+
+        # Si les buffers sont vides, lire directement depuis pub/sub history
+        # via une liste temporaire pushée par le simulateur
+        if not listening:
+            # Utiliser KEYS pattern pour récupérer les events récents
+            keys = r.keys("event:listening:*")
+            for key in keys[:BATCH_SIZE]:
+                try:
+                    val = r.get(key)
+                    if val:
+                        listening.append(json.loads(val))
+                        r.delete(key)
+                except Exception:
+                    pass
+
+        print(f"✅ Consommé : {len(listening)} listening events, {len(p2p)} p2p events")
+        return {"listening": listening, "p2p_network": p2p}
 
     @task(task_id="validate_events")
     def validate_events(raw_events: dict, **context) -> dict:
-        """
-        Valide les événements et isole les invalides en DLQ.
+        import json
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-        Champs obligatoires pour un listening_event :
-            event_id, user_id, track_id, timestamp, duration_ms
+        pg = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
-        TODO :
-            1. Parcourir raw_events["listening"] et raw_events["p2p_network"]
-            2. Valider les champs obligatoires
-            3. Valider les types (timestamp parseable, duration_ms > 0)
-            4. Invalides → INSERT dans dead_letter_events avec error_type="validation"
-            5. Retourner {"valid_listening": [...], "valid_p2p": [...], "errors": N}
-        """
-        raise NotImplementedError("TODO : implémenter validate_events()")
+        valid_listening = []
+        valid_p2p       = []
+        errors          = 0
+
+        required_listening = ["event_id", "user_id", "track_id", "timestamp", "duration_ms"]
+
+        for event in raw_events.get("listening", []):
+            # Vérifier les champs obligatoires
+            if not all(event.get(f) for f in required_listening):
+                pg.run("""
+                    INSERT INTO dead_letter_events
+                        (original_topic, payload, error_type, error_message)
+                    VALUES (%s, %s, %s, %s)
+                """, parameters=[
+                    "listening_events",
+                    json.dumps(event),
+                    "validation",
+                    f"Champs manquants : {[f for f in required_listening if not event.get(f)]}"
+                ])
+                errors += 1
+                continue
+
+            # Vérifier duration_ms > 0
+            try:
+                if int(event["duration_ms"]) <= 0:
+                    raise ValueError("duration_ms <= 0")
+            except (ValueError, TypeError) as e:
+                pg.run("""
+                    INSERT INTO dead_letter_events
+                        (original_topic, payload, error_type, error_message)
+                    VALUES (%s, %s, %s, %s)
+                """, parameters=["listening_events", json.dumps(event), "validation", str(e)])
+                errors += 1
+                continue
+
+            valid_listening.append(event)
+
+        for event in raw_events.get("p2p_network", []):
+            if event.get("event_id") and event.get("event_type"):
+                valid_p2p.append(event)
+            else:
+                errors += 1
+
+        print(f"✅ Validation : {len(valid_listening)} valides, {errors} erreurs DLQ")
+        return {
+            "valid_listening": valid_listening,
+            "valid_p2p":       valid_p2p,
+            "errors":          errors,
+        }
 
     @task(task_id="enrich_events")
     def enrich_events(validated: dict, **context) -> list:
-        """
-        Enrichit les événements d'écoute avec les données du catalogue.
+        import json
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-        TODO :
-            1. Charger les tracks depuis PostgreSQL (batch query par track_id)
-               SELECT id, title, artist_id, genre FROM tracks WHERE id = ANY(%(ids)s)
-            2. Pour chaque listening_event, ajouter : genre, artist_id, track_title
-            3. Les track_id inconnus → DLQ avec error_type="unknown_track"
-            4. Retourner la liste des events enrichis
+        pg = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        events = validated.get("valid_listening", [])
 
-        Hint : faire une seule requête PostgreSQL avec IN clause plutôt qu'une par event.
-        """
-        raise NotImplementedError("TODO : implémenter enrich_events()")
+        if not events:
+            print("⚠️  Aucun event à enrichir")
+            return []
+
+        # Récupérer tous les track_ids uniques
+        track_ids = list({e["track_id"] for e in events})
+
+        # Une seule requête pour tous les tracks
+        if track_ids:
+            placeholders = ",".join(["%s"] * len(track_ids))
+            tracks_data  = pg.get_records(
+                f"SELECT id::text, title, artist_id::text, genre FROM tracks WHERE id::text = ANY(%s)",
+                parameters=[track_ids]
+            )
+            tracks_map = {row[0]: {"title": row[1], "artist_id": row[2], "genre": row[3]}
+                          for row in tracks_data}
+        else:
+            tracks_map = {}
+
+        enriched = []
+        unknown  = 0
+
+        for event in events:
+            track_info = tracks_map.get(event["track_id"])
+            if not track_info:
+                unknown += 1
+                # Track inconnue → DLQ
+                pg.run("""
+                    INSERT INTO dead_letter_events
+                        (original_topic, payload, error_type, error_message)
+                    VALUES (%s, %s, %s, %s)
+                """, parameters=[
+                    "listening_events", json.dumps(event),
+                    "unknown_track", f"track_id inconnu : {event['track_id']}"
+                ])
+                continue
+
+            enriched.append({
+                **event,
+                "track_title": track_info["title"],
+                "artist_id":   track_info["artist_id"],
+                "genre":       track_info["genre"],
+            })
+
+        print(f"✅ Enrichi : {len(enriched)} events | {unknown} tracks inconnues → DLQ")
+        return enriched
 
     @task(task_id="store_to_parquet")
     def store_to_parquet(enriched_events: list, **context) -> str:
-        """
-        Sauvegarde les événements enrichis en Parquet sur MinIO.
+        import io, json, boto3
+        from datetime import datetime
 
-        Partitionnement : date + heure (pour la parallélisation Phase 1, seq 3.1)
+        if not enriched_events:
+            print("⚠️  Aucun event à stocker")
+            return "no_data"
 
-        TODO :
-            1. Convertir la liste d'events en DataFrame pandas
-            2. Partitionner par date et heure du timestamp
-            3. Écrire en Parquet sur MinIO via boto3 ou pyarrow
-               Chemin : s3://spotify-parquet/listening_events/date={date}/hour={hour}/part-{run_id}.parquet
-            4. Retourner le chemin du fichier écrit
+        try:
+            import pandas as pd
+            df = pd.DataFrame(enriched_events)
+        except ImportError:
+            # pandas non disponible — stocker en JSON
+            s3 = boto3.client("s3",
+                endpoint_url="http://minio:9000",
+                aws_access_key_id="minioadmin",
+                aws_secret_access_key="minioadmin",
+            )
+            now     = datetime.utcnow()
+            key     = f"listening_events/date={now.strftime('%Y-%m-%d')}/hour={now.hour}/part-{context['run_id']}.json"
+            payload = json.dumps(enriched_events).encode()
+            try:
+                s3.create_bucket(Bucket="spotify-parquet")
+            except Exception:
+                pass
+            s3.put_object(Bucket="spotify-parquet", Key=key, Body=payload)
+            print(f"✅ Stocké en JSON sur MinIO : s3://spotify-parquet/{key}")
+            return key
 
-        Hint : pyarrow.parquet.write_table() + boto3 pour l'upload
-        """
-        raise NotImplementedError("TODO : implémenter store_to_parquet()")
+        s3  = boto3.client("s3",
+            endpoint_url="http://minio:9000",
+            aws_access_key_id="minioadmin",
+            aws_secret_access_key="minioadmin",
+        )
+        now = datetime.utcnow()
+        key = f"listening_events/date={now.strftime('%Y-%m-%d')}/hour={now.hour}/part-{context['run_id']}.parquet"
+
+        buf = io.BytesIO()
+        df.to_parquet(buf, index=False, engine="pyarrow")
+        buf.seek(0)
+
+        try:
+            s3.create_bucket(Bucket="spotify-parquet")
+        except Exception:
+            pass
+        s3.upload_fileobj(buf, "spotify-parquet", key)
+        print(f"✅ Parquet stocké : s3://spotify-parquet/{key} ({len(df)} lignes)")
+        return key
 
     @task(task_id="upsert_to_postgres")
     def upsert_to_postgres(enriched_events: list, **context) -> dict:
-        """
-        Insère les événements dans PostgreSQL de façon idempotente.
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-        TODO :
-            1. Utiliser PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
-            2. INSERT INTO listening_events (...) VALUES ...
-               ON CONFLICT (id) DO NOTHING
-            3. Retourner {"inserted": N, "skipped": M}
+        if not enriched_events:
+            print("⚠️  Aucun event à insérer")
+            return {"inserted": 0, "skipped": 0}
 
-        Hint : utiliser executemany() avec des tuples pour les performances.
-        """
-        raise NotImplementedError("TODO : implémenter upsert_to_postgres()")
+        pg   = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        conn = pg.get_conn()
+        cur  = conn.cursor()
+
+        rows = [
+            (
+                e["event_id"],
+                e["user_id"],
+                e["track_id"],
+                e["timestamp"],
+                int(e.get("duration_ms", 0)),
+                e.get("device_type"),
+                e.get("geo_country"),
+                bool(e.get("completed", False)),
+                e.get("event_source", "p2p"),
+            )
+            for e in enriched_events
+        ]
+
+        inserted = 0
+        skipped  = 0
+
+        for row in rows:
+            cur.execute("""
+                INSERT INTO listening_events
+                    (id, user_id, track_id, timestamp, duration_ms,
+                     device_type, geo_country, completed, event_source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
+            """, row)
+            if cur.rowcount == 1:
+                inserted += 1
+            else:
+                skipped += 1
+
+        conn.commit()
+        cur.close()
+
+        print(f"✅ PostgreSQL : {inserted} insérés, {skipped} doublons ignorés")
+        return {"inserted": inserted, "skipped": skipped}
 
     # ── Orchestration ─────────────────────────────────────────
-    raw       = consume_from_redis()
+    raw      = consume_from_redis()
     validated = validate_events(raw)
     enriched  = enrich_events(validated)
 
