@@ -160,14 +160,20 @@ class P2PSimulator:
         """
         track = random.choice(SAMPLE_TRACKS)
 
-        # TODO : compléter ici
+        # TODO : compléter ici ... done
+        duration_ms = random.randint(30000, track["duration_ms"])
+
         event = {
-            "event_id":    str(uuid.uuid4()),
-            "user_id":     random.choice(SAMPLE_USERS),
-            "track_id":    track["id"],
-            "source_peer": random.choice(self.active_peers),
-            "timestamp":   datetime.utcnow().isoformat() + "Z",
-            # À compléter...
+            "event_id":     str(uuid.uuid4()),
+            "user_id":      random.choice(SAMPLE_USERS),
+            "track_id":     track["id"],
+            "source_peer":  random.choice(self.active_peers),
+            "timestamp":    datetime.utcnow().isoformat() + "Z",
+            "duration_ms":  duration_ms,
+            "device_type":  random.choice(DEVICE_TYPES),
+            "geo_country":  random.choice(GEO_COUNTRIES),
+            "completed":    duration_ms > 30000,
+            "event_source": random.choice(EVENT_SOURCES),
         }
 
         # Mode fraud (Phase 2) — décommenter
@@ -199,14 +205,23 @@ class P2PSimulator:
             "chunk_transfer", "cache_hit", "cache_miss"
         ])
 
-        # TODO : compléter selon event_type
+        # TODO : compléter selon event_type ... done
         event = {
             "event_id":   str(uuid.uuid4()),
             "event_type": event_type,
             "peer_id":    random.choice(self.active_peers),
             "timestamp":  datetime.utcnow().isoformat() + "Z",
-            # À compléter...
         }
+
+        if event_type == "chunk_transfer":
+            event["target_peer"]    = random.choice(self.active_peers)
+            event["chunk_size_kb"]  = random.randint(64, 512)
+            event["track_id"]       = random.choice(SAMPLE_TRACKS)["id"]
+        elif event_type in ("cache_hit", "cache_miss"):
+            event["track_id"]       = random.choice(SAMPLE_TRACKS)["id"]
+        elif event_type == "peer_connect":
+            event["geo_country"]    = random.choice(GEO_COUNTRIES)
+
         return event
 
     # ── Publication ──────────────────────────────────────────
@@ -226,7 +241,10 @@ class P2PSimulator:
         Utiliser self.redis.publish(channel, payload)
         Gérer l'exception si Redis est indisponible (log + skip).
         """
-        raise NotImplementedError("TODO : implémenter _publish_to_redis()")
+        try:
+            self.redis.publish(channel, payload)
+        except Exception as e:
+            logger.error(f"Redis indisponible, événement perdu : {e}")
 
     # def _publish_to_kafka(self, topic: str, key: str, payload: str):
     #     """
