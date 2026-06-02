@@ -14,15 +14,6 @@ Architecture :
         → transform_catalog()        ← normalisation, dédoublonnage
         → load_to_postgres()         ← upsert avec ON CONFLICT
         → notify_success()
-
-TODO :
-    [ ] Implémenter extract_from_minio() — lire les JSONs depuis MinIO
-    [ ] Implémenter validate_schema() — vérifier les champs obligatoires
-    [ ] Implémenter transform_catalog() — normaliser les noms d'artistes, déduplication
-    [ ] Implémenter load_to_postgres() — upsert avec gestion des conflits
-    [ ] Configurer retry_delay et retries sur les tâches réseau
-    [ ] Ajouter un on_failure_callback pour alerting
-    [ ] Activer le doc_md sur ce DAG (voir variable DAG_DOC ci-dessous)
 """
 
 from datetime import datetime, timedelta
@@ -30,10 +21,9 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.models import Variable
 
 # ─────────────────────────────────────────────────────────────
-# DOCUMENTATION DU DAG (obligatoire pour la note)
+# DOCUMENTATION DU DAG
 # ─────────────────────────────────────────────────────────────
 
 DAG_DOC = """
@@ -67,26 +57,26 @@ produit le même résultat grâce aux upserts ON CONFLICT DO UPDATE.
 """
 
 # ─────────────────────────────────────────────────────────────
-# CONFIGURATION PAR DÉFAUT
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
 DEFAULT_ARGS = {
-    "owner":                 "spotify-team",
-    "depends_on_past":       False,
-    "start_date":            datetime(2025, 1, 1),
-    "email_on_failure":      False,
-    "email_on_retry":        False,
-    "retries":               3,
-    "retry_delay":           timedelta(minutes=5),
+    "owner":                     "spotify-team",
+    "depends_on_past":           False,
+    "start_date":                datetime(2025, 1, 1),
+    "email_on_failure":          False,
+    "email_on_retry":            False,
+    "retries":                   3,
+    "retry_delay":               timedelta(minutes=5),
     "retry_exponential_backoff": True,
-    "execution_timeout":     timedelta(minutes=30),
+    "execution_timeout":         timedelta(minutes=30),
 }
 
 POSTGRES_CONN_ID = "spotify_postgres"
-MINIO_CONN_ID    = "spotify_minio"
 MINIO_BUCKET     = "labels-raw"
 LABEL_FILES      = ["sunset_records.json", "nightwave_music.json", "urban_pulse.json"]
 
+VALID_GENRES = ["Pop", "Rock", "Hip-Hop", "Electronic", "Jazz", "R&B", "Folk", "Latin", "Metal", "Classical"]
 
 # ─────────────────────────────────────────────────────────────
 # DAG DEFINITION
@@ -104,93 +94,283 @@ with DAG(
 ) as dag:
 
     @task(task_id="extract_from_minio")
-    def extract_from_minio(**context) -> list[dict]:
+    def extract_from_minio(**context) -> list:
         """
         Télécharge les fichiers JSON des labels depuis MinIO.
-
-        TODO :
-            1. Se connecter à MinIO via AwsBaseHook ou boto3
-               (endpoint_url = http://minio:9000)
-            2. Pour chaque fichier dans LABEL_FILES, télécharger et parser le JSON
-            3. Retourner une liste de catalogues : [catalog_label_a, catalog_label_b, ...]
-            4. Si un fichier est manquant : logger un warning et continuer
-               (pas de crash — on traite ce qu'on a)
-
-        Returns:
-            list[dict] : catalogues bruts des labels
+        Retourne une liste de catalogues bruts.
         """
-        raise NotImplementedError("TODO : implémenter extract_from_minio()")
+        import boto3
+        import json
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Connexion à MinIO via boto3 (compatible S3)
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="http://minio:9000",
+            aws_access_key_id="minioadmin",
+            aws_secret_access_key="minioadmin",
+            region_name="us-east-1",
+        )
+
+        catalogs = []
+        for filename in LABEL_FILES:
+            try:
+                response = s3.get_object(Bucket=MINIO_BUCKET, Key=filename)
+                catalog = json.loads(response["Body"].read().decode("utf-8"))
+                catalogs.append(catalog)
+                logger.info(f"✅ Fichier chargé : {filename} — {catalog.get('stats', {})}")
+            except Exception as e:
+                logger.warning(f"⚠️ Fichier manquant ou erreur : {filename} — {e}")
+
+        logger.info(f"Total catalogues chargés : {len(catalogs)}")
+        return catalogs
 
     @task(task_id="validate_schema")
-    def validate_schema(raw_catalogs: list[dict]) -> dict:
+    def validate_schema(raw_catalogs: list) -> dict:
         """
-        Valide le schéma de chaque catalogue et isole les entrées invalides.
-
-        Champs obligatoires pour un artiste  : id, name, label
-        Champs obligatoires pour un album    : id, artist_id, title
-        Champs obligatoires pour un track    : id, artist_id, title, duration_ms
-
-        TODO :
-            1. Parcourir artists, albums, tracks de chaque catalogue
-            2. Pour chaque entrée, vérifier la présence des champs obligatoires
-            3. Les entrées invalides → insérer dans dead_letter_events avec error_type="schema_validation"
-            4. Retourner {"valid": {...}, "errors_count": N}
-
-        Hint : utiliser PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        Valide le schéma de chaque catalogue.
+        Les entrées invalides sont envoyées en DLQ.
         """
-        raise NotImplementedError("TODO : implémenter validate_schema()")
+        import logging
+        import json
+
+        logger = logging.getLogger(__name__)
+
+        # Champs obligatoires par type
+        REQUIRED_ARTIST = ["id", "name", "label"]
+        REQUIRED_ALBUM  = ["id", "artist_id", "title"]
+        REQUIRED_TRACK  = ["id", "artist_id", "title", "duration_ms"]
+
+        valid_artists = []
+        valid_albums  = []
+        valid_tracks  = []
+        errors        = []
+
+        def check_fields(entry, required_fields, entry_type):
+            missing = [f for f in required_fields if not entry.get(f)]
+            if missing:
+                errors.append({
+                    "type":    entry_type,
+                    "entry":   entry,
+                    "missing": missing,
+                })
+                return False
+            return True
+
+        for catalog in raw_catalogs:
+            label = catalog.get("label", "unknown")
+            logger.info(f"Validation du catalogue : {label}")
+
+            for artist in catalog.get("artists", []):
+                if check_fields(artist, REQUIRED_ARTIST, "artist"):
+                    valid_artists.append(artist)
+
+            for album in catalog.get("albums", []):
+                if check_fields(album, REQUIRED_ALBUM, "album"):
+                    valid_albums.append(album)
+
+            for track in catalog.get("tracks", []):
+                if check_fields(track, REQUIRED_TRACK, "track"):
+                    valid_tracks.append(track)
+
+        # Envoyer les erreurs en DLQ
+        if errors:
+            hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+            conn = hook.get_conn()
+            cur  = conn.cursor()
+            for error in errors:
+                cur.execute("""
+                    INSERT INTO dead_letter_events
+                        (original_topic, payload, error_type, error_message)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    "catalog_ingestion",
+                    json.dumps(error["entry"]),
+                    "schema_validation",
+                    f"Champs manquants : {error['missing']}",
+                ))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.warning(f"⚠️ {len(errors)} entrées invalides envoyées en DLQ")
+
+        logger.info(f"✅ Valides — Artists: {len(valid_artists)}, Albums: {len(valid_albums)}, Tracks: {len(valid_tracks)}")
+
+        return {
+            "valid": {
+                "artists": valid_artists,
+                "albums":  valid_albums,
+                "tracks":  valid_tracks,
+            },
+            "errors_count": len(errors),
+        }
 
     @task(task_id="transform_catalog")
     def transform_catalog(validated: dict) -> dict:
         """
         Transforme et normalise les données du catalogue.
-
-        TODO :
-            1. Normaliser les noms d'artistes (strip, title case, suppression doublons)
-            2. Valider les durées de tracks (duration_ms > 0 et < 3_600_000)
-            3. Normaliser les genres (correspondance avec la table genres)
-            4. Construire les listes d'upsert : artists[], albums[], tracks[]
-
-        Returns:
-            dict avec keys "artists", "albums", "tracks"
         """
-        raise NotImplementedError("TODO : implémenter transform_catalog()")
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        data = validated.get("valid", {})
+
+        artists = data.get("artists", [])
+        albums  = data.get("albums",  [])
+        tracks  = data.get("tracks",  [])
+
+        # ── Normaliser les artistes ──────────────────────────
+        seen_artists = set()
+        clean_artists = []
+        for artist in artists:
+            artist["name"] = artist["name"].strip().title()
+            key = (artist["name"], artist["label"])
+            if key not in seen_artists:
+                seen_artists.add(key)
+                clean_artists.append(artist)
+
+        # ── Normaliser les tracks ────────────────────────────
+        clean_tracks = []
+        for track in tracks:
+            # Filtrer les durées invalides
+            duration = track.get("duration_ms", 0)
+            if not (0 < duration < 3_600_000):
+                logger.warning(f"Track ignorée (durée invalide) : {track.get('title')} — {duration}ms")
+                continue
+
+            # Normaliser le genre
+            genre = track.get("genre", "")
+            if genre not in VALID_GENRES:
+                track["genre"] = "Pop"  # genre par défaut
+
+            track["title"] = track["title"].strip()
+            clean_tracks.append(track)
+
+        logger.info(f"✅ Après transformation — Artists: {len(clean_artists)}, Albums: {len(albums)}, Tracks: {len(clean_tracks)}")
+
+        return {
+            "artists": clean_artists,
+            "albums":  albums,
+            "tracks":  clean_tracks,
+        }
 
     @task(task_id="load_to_postgres")
     def load_to_postgres(transformed: dict, **context) -> dict:
         """
         Charge les données dans PostgreSQL avec upsert idempotent.
-
-        TODO :
-            1. Utiliser PostgresHook pour obtenir une connexion
-            2. Artists : INSERT ... ON CONFLICT (name, label) DO UPDATE SET ...
-            3. Albums  : INSERT ... ON CONFLICT (id) DO UPDATE SET ...
-            4. Tracks  : INSERT ... ON CONFLICT (id) DO UPDATE SET updated_at=NOW()
-            5. Commit et retourner les stats {tracks_inserted, artists_inserted, ...}
-            6. Pousser stats dans XCom pour le monitoring
-
-        Hint : utiliser executemany() avec des listes de tuples pour les performances.
         """
-        raise NotImplementedError("TODO : implémenter load_to_postgres()")
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        artists = transformed.get("artists", [])
+        albums  = transformed.get("albums",  [])
+        tracks  = transformed.get("tracks",  [])
+
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        conn = hook.get_conn()
+        cur  = conn.cursor()
+
+        artists_inserted = 0
+        albums_inserted  = 0
+        tracks_inserted  = 0
+
+        # ── Upsert Artists ───────────────────────────────────
+        for artist in artists:
+            cur.execute("""
+                INSERT INTO artists (id, name, country, label, genres, monthly_listeners)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (name, label) DO UPDATE SET
+                    country           = EXCLUDED.country,
+                    genres            = EXCLUDED.genres,
+                    monthly_listeners = EXCLUDED.monthly_listeners,
+                    updated_at        = NOW()
+            """, (
+                artist["id"],
+                artist["name"],
+                artist.get("country"),
+                artist["label"],
+                artist.get("genres", []),
+                artist.get("monthly_listeners", 0),
+            ))
+            artists_inserted += 1
+
+        # ── Upsert Albums ────────────────────────────────────
+        for album in albums:
+            cur.execute("""
+                INSERT INTO albums (id, artist_id, title, release_year, total_tracks)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    title        = EXCLUDED.title,
+                    release_year = EXCLUDED.release_year,
+                    total_tracks = EXCLUDED.total_tracks
+            """, (
+                album["id"],
+                album["artist_id"],
+                album["title"],
+                album.get("release_year"),
+                album.get("total_tracks", 0),
+            ))
+            albums_inserted += 1
+
+        # ── Upsert Tracks ────────────────────────────────────
+        for track in tracks:
+            cur.execute("""
+                INSERT INTO tracks (id, album_id, artist_id, title, duration_ms, genre, bpm, explicit, audio_file_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    title           = EXCLUDED.title,
+                    duration_ms     = EXCLUDED.duration_ms,
+                    genre           = EXCLUDED.genre,
+                    updated_at      = NOW()
+            """, (
+                track["id"],
+                track.get("album_id"),
+                track["artist_id"],
+                track["title"],
+                track["duration_ms"],
+                track.get("genre"),
+                track.get("bpm"),
+                track.get("explicit", False),
+                track.get("audio_file_path"),
+            ))
+            tracks_inserted += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        stats = {
+            "artists_inserted": artists_inserted,
+            "albums_inserted":  albums_inserted,
+            "tracks_inserted":  tracks_inserted,
+            "errors_count":     0,
+        }
+
+        logger.info(f"✅ Chargement terminé — {stats}")
+        return stats
 
     @task(task_id="notify_success")
     def notify_success(stats: dict, **context):
         """
         Log de succès avec statistiques d'ingestion.
-        Optionnel : envoyer une notification (webhook Slack simulé).
         """
         dag_run = context["dag_run"]
         print(f"""
         ✅ catalog_ingestion_pipeline terminé
-        DAGRun : {dag_run.run_id}
-        Tracks insérées  : {stats.get('tracks_inserted', 0)}
-        Artists insérés  : {stats.get('artists_inserted', 0)}
-        Erreurs DLQ      : {stats.get('errors_count', 0)}
+        DAGRun          : {dag_run.run_id}
+        Artists insérés : {stats.get('artists_inserted', 0)}
+        Albums insérés  : {stats.get('albums_inserted', 0)}
+        Tracks insérés  : {stats.get('tracks_inserted', 0)}
+        Erreurs DLQ     : {stats.get('errors_count', 0)}
         """)
 
     # ── Orchestration des tâches ──────────────────────────────
-    raw       = extract_from_minio()
-    validated = validate_schema(raw)
+    raw         = extract_from_minio()
+    validated   = validate_schema(raw)
     transformed = transform_catalog(validated)
-    stats     = load_to_postgres(transformed)
+    stats       = load_to_postgres(transformed)
     notify_success(stats)
