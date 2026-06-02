@@ -119,7 +119,28 @@ with DAG(
         Returns:
             list[dict] : catalogues bruts des labels
         """
-        raise NotImplementedError("TODO : implémenter extract_from_minio()")
+        import json
+        import boto3
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="http://minio:9000",
+            aws_access_key_id="minioadmin",
+            aws_secret_access_key="minioadmin",
+        )
+
+        catalogs = []
+
+        for filename in LABEL_FILES:
+            try:
+                obj = s3.get_object(Bucket=MINIO_BUCKET, Key=filename)
+                catalog = json.loads(obj["Body"].read().decode("utf-8"))
+                catalogs.append(catalog)
+                print(f"Catalogue chargé : {filename}")
+            except Exception as e:
+                print(f"Warning : impossible de charger {filename} : {e}")
+
+        return catalogs
 
     @task(task_id="validate_schema")
     def validate_schema(raw_catalogs: list[dict]) -> dict:
@@ -138,7 +159,37 @@ with DAG(
 
         Hint : utiliser PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         """
-        raise NotImplementedError("TODO : implémenter validate_schema()")
+        valid = {
+            "artists": [],
+            "albums": [],
+            "tracks": [],
+        }
+
+        errors_count = 0
+
+        required_fields = {
+            "artists": ["id", "name", "label"],
+            "albums": ["id", "artist_id", "title"],
+            "tracks": ["id", "artist_id", "title", "duration_ms"],
+        }
+
+        for catalog in raw_catalogs:
+            for section, fields in required_fields.items():
+                for item in catalog.get(section, []):
+                    missing_fields = [field for field in fields if not item.get(field)]
+
+                    if missing_fields:
+                        errors_count += 1
+                        print(
+                            f"Entrée invalide dans {section} : champs manquants {missing_fields}"
+                        )
+                    else:
+                        valid[section].append(item)
+
+        return {
+            "valid": valid,
+            "errors_count": errors_count,
+        }
 
     @task(task_id="transform_catalog")
     def transform_catalog(validated: dict) -> dict:
@@ -154,7 +205,52 @@ with DAG(
         Returns:
             dict avec keys "artists", "albums", "tracks"
         """
-        raise NotImplementedError("TODO : implémenter transform_catalog()")
+        valid = validated["valid"]
+
+        artists = []
+        albums = []
+        tracks = []
+
+        seen_artists = set()
+        seen_albums = set()
+        seen_tracks = set()
+
+        for artist in valid.get("artists", []):
+            artist_id = artist["id"]
+            name = artist["name"].strip().title()
+            label = artist["label"].strip()
+
+            key = (name, label)
+
+            if key not in seen_artists:
+                seen_artists.add(key)
+                artists.append({
+                    "id": artist_id,
+                    "name": name,
+                    "label": label,
+                })
+
+        for album in valid.get("albums", []):
+            album_id = album["id"]
+
+            if album_id not in seen_albums:
+                seen_albums.add(album_id)
+                albums.append(album)
+
+        for track in valid.get("tracks", []):
+            track_id = track["id"]
+            duration = track.get("duration_ms", 0)
+
+            if track_id not in seen_tracks and duration > 0 and duration < 3600000:
+                seen_tracks.add(track_id)
+                tracks.append(track)
+
+        return {
+            "artists": artists,
+            "albums": albums,
+            "tracks": tracks,
+            "errors_count": validated.get("errors_count", 0),
+        }
 
     @task(task_id="load_to_postgres")
     def load_to_postgres(transformed: dict, **context) -> dict:
@@ -171,8 +267,122 @@ with DAG(
 
         Hint : utiliser executemany() avec des listes de tuples pour les performances.
         """
-        raise NotImplementedError("TODO : implémenter load_to_postgres()")
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        conn = hook.get_conn()
+        cursor = conn.cursor()
 
+        artists = transformed.get("artists", [])
+        albums = transformed.get("albums", [])
+        tracks = transformed.get("tracks", [])
+        errors_count = transformed.get("errors_count", 0)
+
+        artists_sql = """
+            INSERT INTO artists (
+                id, name, label, updated_at
+            )
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (id)
+            DO UPDATE SET
+                name = EXCLUDED.name,
+                label = EXCLUDED.label,
+                updated_at = NOW()
+        """
+
+        albums_sql = """
+            INSERT INTO albums (
+                id, artist_id, title, release_year, total_tracks
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id)
+            DO UPDATE SET
+                artist_id = EXCLUDED.artist_id,
+                title = EXCLUDED.title,
+                release_year = EXCLUDED.release_year,
+                total_tracks = EXCLUDED.total_tracks
+        """
+
+        tracks_sql = """
+            INSERT INTO tracks (
+                id, album_id, artist_id, title, duration_ms,
+                genre, bpm, explicit, audio_file_path, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (id)
+            DO UPDATE SET
+                album_id = EXCLUDED.album_id,
+                artist_id = EXCLUDED.artist_id,
+                title = EXCLUDED.title,
+                duration_ms = EXCLUDED.duration_ms,
+                genre = EXCLUDED.genre,
+                bpm = EXCLUDED.bpm,
+                explicit = EXCLUDED.explicit,
+                audio_file_path = EXCLUDED.audio_file_path,
+                updated_at = NOW()
+        """
+
+        try:
+            artist_rows = [
+                (
+                    artist["id"],
+                    artist["name"],
+                    artist.get("label"),
+                )
+                for artist in artists
+            ]
+
+            album_rows = [
+                (
+                    album["id"],
+                    album["artist_id"],
+                    album["title"],
+                    album.get("release_year"),
+                    album.get("total_tracks"),
+                )
+                for album in albums
+            ]
+
+            track_rows = [
+                (
+                    track["id"],
+                    track.get("album_id"),
+                    track["artist_id"],
+                    track["title"],
+                    track["duration_ms"],
+                    track.get("genre"),
+                    track.get("bpm"),
+                    track.get("explicit", False),
+                    track.get("audio_file_path"),
+                )
+                for track in tracks
+            ]
+
+            cursor.executemany(artists_sql, artist_rows)
+            cursor.executemany(albums_sql, album_rows)
+            cursor.executemany(tracks_sql, track_rows)
+
+            conn.commit()
+
+            stats = {
+                "artists_inserted": len(artist_rows),
+                "albums_inserted": len(album_rows),
+                "tracks_inserted": len(track_rows),
+                "errors_count": errors_count,
+            }
+
+            print(f"Artists upserted : {stats['artists_inserted']}")
+            print(f"Albums upserted  : {stats['albums_inserted']}")
+            print(f"Tracks upserted  : {stats['tracks_inserted']}")
+            print(f"Errors count     : {stats['errors_count']}")
+
+            return stats
+
+        except Exception as e:
+            conn.rollback()
+            raise e
+
+        finally:
+            cursor.close()
+            conn.close()
     @task(task_id="notify_success")
     def notify_success(stats: dict, **context):
         """

@@ -1,3 +1,4 @@
+.DS_Store
 # Python
 __pycache__/
 *.py[cod]
@@ -31,3 +32,4 @@ solutions/*
 # Airflow
 airflow.cfg
 airflow.db
+
