@@ -21,7 +21,6 @@ import signal
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 
 import redis
 
@@ -47,6 +46,9 @@ TOPICS = {
     "p2p_network": "p2p_network_events",
 }
 
+# Taille max des queues Redis pour éviter un débordement mémoire
+QUEUE_MAX_LEN = 10_000
+
 DEVICE_TYPES  = ["mobile", "desktop", "smart_speaker", "web", "tv"]
 GEO_COUNTRIES = ["FR", "DE", "US", "GB", "ES", "IT", "BR", "JP", "KR", "AU"]
 EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]  # pondéré : 60% P2P
@@ -64,7 +66,6 @@ SAMPLE_TRACKS = [
 ]
 
 SAMPLE_USERS = [str(uuid.uuid4()) for _ in range(200)]
-SAMPLE_PEERS = [str(uuid.uuid4()) for _ in range(20)]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -78,6 +79,10 @@ class P2PSimulator:
     Génère deux types d'événements :
     - listening_events   : un utilisateur écoute un morceau via un peer
     - p2p_network_events : connexion/déconnexion/transfert entre peers
+
+    Publie dans :
+    - Redis pub/sub channel (pour les consommateurs temps réel)
+    - Redis LIST *_queue    (pour le DAG streaming_events_pipeline)
     """
 
     def __init__(
@@ -140,7 +145,9 @@ class P2PSimulator:
                 logger.info("Catalogue chargé depuis PostgreSQL : %d tracks", len(rows))
                 return [{"id": r[0], "title": r[1], "duration_ms": r[2]} for r in rows]
         except Exception as exc:
-            logger.warning("PostgreSQL indisponible (%s) — utilisation du catalogue de test", exc)
+            logger.warning(
+                "PostgreSQL indisponible (%s) — utilisation du catalogue de test", exc
+            )
         return SAMPLE_TRACKS
 
     def run(self):
@@ -198,8 +205,8 @@ class P2PSimulator:
             event["completed"]   = False
 
         if self.mode == "late_events" and random.random() < 0.4:
-            delay_minutes    = random.randint(5, 30)
-            ts               = datetime.utcnow() - timedelta(minutes=delay_minutes)
+            delay_minutes      = random.randint(5, 30)
+            ts                 = datetime.utcnow() - timedelta(minutes=delay_minutes)
             event["timestamp"] = ts.isoformat() + "Z"
 
         return event
@@ -236,7 +243,7 @@ class P2PSimulator:
             event["track_id"]             = track["id"]
             event["chunk_size_kb"]        = random.randint(64, 512)
             event["transfer_duration_ms"] = random.randint(50, 2_000)
-            event["success"]              = random.random() > 0.05  # 95% réussite
+            event["success"]              = random.random() > 0.05
 
         elif event_type == "cache_hit":
             event["track_id"]          = track["id"]
@@ -251,30 +258,33 @@ class P2PSimulator:
     # ── Publication ──────────────────────────────────────────
 
     def _publish_event(self, topic_key: str, event: dict):
-        """Publie un événement dans Redis et (Phase 2) dans Kafka."""
+        """Publie un événement dans Redis pub/sub ET dans une LIST pour le DAG."""
         payload = json.dumps(event)
         channel = TOPICS[topic_key]
-
         self._publish_to_redis(channel, payload)
         # Phase 2 — décommenter
         # self._publish_to_kafka(channel, event.get("user_id", ""), payload)
 
     def _publish_to_redis(self, channel: str, payload: str):
-        """Publie payload dans le channel Redis via pub/sub."""
+        """
+        Publie dans le channel Redis pub/sub ET pousse dans une LIST bornée.
+        La LIST permet au DAG streaming_events_pipeline de consommer en micro-batch.
+        """
         try:
-            self.redis.publish(channel, payload)
+            pipe = self.redis.pipeline()
+            # Pub/sub pour les consommateurs temps réel
+            pipe.publish(channel, payload)
+            # LIST pour le DAG (consommation différée)
+            pipe.lpush(f"{channel}_queue", payload)
+            pipe.ltrim(f"{channel}_queue", 0, QUEUE_MAX_LEN - 1)
+            pipe.execute()
         except redis.exceptions.ConnectionError as exc:
             logger.error("Redis indisponible, événement ignoré : %s", exc)
         except Exception as exc:
             logger.error("Erreur Redis inattendue : %s", exc)
 
     # def _publish_to_kafka(self, topic: str, key: str, payload: str):
-    #     """
-    #     TODO Phase 2 : publier payload dans le topic Kafka.
-    #     - key     : utilisé pour le partitionnement (user_id ou peer_id)
-    #     - acks    : 'all' pour la durabilité
-    #     - Gérer le callback de confirmation (delivery_report)
-    #     """
+    #     """TODO Phase 2 : publier dans Kafka avec acks='all'."""
     #     raise NotImplementedError("TODO Phase 2 : implémenter _publish_to_kafka()")
 
     def _shutdown(self, signum, frame):
