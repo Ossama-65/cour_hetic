@@ -97,7 +97,7 @@ with DAG(
     default_args=DEFAULT_ARGS,
     description="Ingestion quotidienne du catalogue musical depuis MinIO vers PostgreSQL",
     schedule_interval="0 2 * * *",
-    catchup=False,
+    catchup=True,
     max_active_runs=1,
     tags=["spotify", "phase-1", "ingestion", "catalogue"],
     doc_md=DAG_DOC,
