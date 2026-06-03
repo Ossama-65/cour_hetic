@@ -23,9 +23,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import redis
-
-# Phase 2 — décommenter quand Kafka est prêt
-# from confluent_kafka import Producer
+from confluent_kafka import Producer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,8 +36,9 @@ logger = logging.getLogger("p2p_simulator")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-REDIS_URL       = "redis://localhost:6379/1"
-KAFKA_BOOTSTRAP = "kafka-1:9092"  # Phase 2
+import os
+REDIS_URL       = os.getenv("REDIS_URL",      "redis://localhost:6379/1")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka-1:9092")
 
 TOPICS = {
     "listening":   "listening_events",
@@ -101,8 +100,15 @@ class P2PSimulator:
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
         self._check_redis()
 
-        # Phase 2 — Kafka producer
-        # self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
+        # Kafka producer — exactly-once (idempotent)
+        self.kafka_producer = Producer({
+            "bootstrap.servers":  KAFKA_BOOTSTRAP,
+            "acks":               "all",
+            "enable.idempotence": True,
+            "retries":            5,
+            "retry.backoff.ms":   300,
+        })
+        self._kafka_available = self._check_kafka()
 
         # Peers actifs simulés
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
@@ -127,6 +133,16 @@ class P2PSimulator:
         except redis.exceptions.ConnectionError as exc:
             logger.error("Redis inaccessible (%s) — arrêt du simulateur", exc)
             raise SystemExit(1) from exc
+
+    def _check_kafka(self) -> bool:
+        """Vérifie que le cluster Kafka est accessible. Retourne False si indisponible."""
+        try:
+            meta = self.kafka_producer.list_topics(timeout=5)
+            logger.info("Kafka connecté : %s (%d topics)", KAFKA_BOOTSTRAP, len(meta.topics))
+            return True
+        except Exception as exc:
+            logger.warning("Kafka indisponible (%s) — publication Redis uniquement", exc)
+            return False
 
     def _load_catalog(self) -> list:
         """
@@ -258,12 +274,12 @@ class P2PSimulator:
     # ── Publication ──────────────────────────────────────────
 
     def _publish_event(self, topic_key: str, event: dict):
-        """Publie un événement dans Redis pub/sub ET dans une LIST pour le DAG."""
+        """Publie un événement dans Redis ET Kafka (si disponible)."""
         payload = json.dumps(event)
         channel = TOPICS[topic_key]
         self._publish_to_redis(channel, payload)
-        # Phase 2 — décommenter
-        # self._publish_to_kafka(channel, event.get("user_id", ""), payload)
+        if self._kafka_available:
+            self._publish_to_kafka(channel, event.get("user_id") or event.get("peer_id", ""), payload)
 
     def _publish_to_redis(self, channel: str, payload: str):
         """
@@ -283,9 +299,27 @@ class P2PSimulator:
         except Exception as exc:
             logger.error("Erreur Redis inattendue : %s", exc)
 
-    # def _publish_to_kafka(self, topic: str, key: str, payload: str):
-    #     """TODO Phase 2 : publier dans Kafka avec acks='all'."""
-    #     raise NotImplementedError("TODO Phase 2 : implémenter _publish_to_kafka()")
+    def _publish_to_kafka(self, topic: str, key: str, payload: str):
+        """
+        Publie dans Kafka avec garanties exactly-once.
+        - acks='all'              : attend la confirmation de tous les ISR
+        - enable.idempotence=True : évite les doublons en cas de retry
+        - key                     : partitionnement déterministe (user_id / peer_id)
+        """
+        def _delivery_report(err, msg):
+            if err:
+                logger.error("Kafka delivery failed [%s] : %s", msg.topic(), err)
+
+        try:
+            self.kafka_producer.produce(
+                topic=topic,
+                key=key.encode("utf-8") if key else None,
+                value=payload.encode("utf-8"),
+                callback=_delivery_report,
+            )
+            self.kafka_producer.poll(0)  # déclenche les callbacks non bloquants
+        except Exception as exc:
+            logger.error("Erreur Kafka inattendue : %s", exc)
 
     def _shutdown(self, signum, frame):
         logger.info(
@@ -293,6 +327,10 @@ class P2PSimulator:
             signum, self.event_count
         )
         self.running = False
+        if self._kafka_available:
+            remaining = self.kafka_producer.flush(timeout=10)
+            if remaining:
+                logger.warning("%d messages Kafka non livrés à l'arrêt", remaining)
 
 
 # ─────────────────────────────────────────────────────────────
