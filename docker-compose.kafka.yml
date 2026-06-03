@@ -1,3 +1,8 @@
+networks:
+  default:
+    name: spotify_default
+    external: true
+
 services:
   kafka-1:
     image: confluentinc/cp-kafka:7.6.0
@@ -13,7 +18,7 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
       KAFKA_DEFAULT_REPLICATION_FACTOR: 3
       KAFKA_MIN_INSYNC_REPLICAS: 2
-      KAFKA_CLUSTER_ID: spotify-cluster-001
+      CLUSTER_ID: uTeNd1K8Q3iE1D1u86qa7w
     volumes:
       - kafka-1-data:/var/lib/kafka/data
     ports:
@@ -30,7 +35,7 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9095,3@kafka-3:9097
-      KAFKA_CLUSTER_ID: spotify-cluster-001
+      CLUSTER_ID: uTeNd1K8Q3iE1D1u86qa7w
     volumes:
       - kafka-2-data:/var/lib/kafka/data
 
@@ -45,7 +50,7 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9095,3@kafka-3:9097
-      KAFKA_CLUSTER_ID: spotify-cluster-001
+      CLUSTER_ID: uTeNd1K8Q3iE1D1u86qa7w
     volumes:
       - kafka-3-data:/var/lib/kafka/data
 
