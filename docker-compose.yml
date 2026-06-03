@@ -1,7 +1,7 @@
 x-airflow-common: &airflow-common
   image: apache/airflow:2.9.1-python3.11
-  environment: &airflow-common-env
-_PIP_ADDITIONAL_REQUIREMENTS: "scikit-learn==1.4.0 numpy==1.26.4"
+environment: &airflow-common-env
+    _PIP_ADDITIONAL_REQUIREMENTS: "scikit-learn==1.4.0 numpy==1.26.4"
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
