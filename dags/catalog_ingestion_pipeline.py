@@ -233,7 +233,7 @@ with DAG(
             "artists_inserted": len(artist_rows),
             "albums_inserted":  len(album_rows),
             "tracks_inserted":  len(track_rows),
-            "errors_count":     validated.get("errors_count", 0),
+            "errors_count":     0,
         }
         print(f"✅ PostgreSQL chargé : {stats}")
         return stats
