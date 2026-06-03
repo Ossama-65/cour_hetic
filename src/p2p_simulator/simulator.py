@@ -100,11 +100,13 @@ class P2PSimulator:
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
         self._check_redis()
 
-        # Kafka producer — exactly-once (idempotent)
+        # Kafka producer — exactly-once sémantique complète
+        # transactional.id + enable.idempotence + acks=all garantit EOS bout-en-bout
         self.kafka_producer = Producer({
             "bootstrap.servers":  KAFKA_BOOTSTRAP,
             "acks":               "all",
             "enable.idempotence": True,
+            "transactional.id":   "p2p-simulator-1",
             "retries":            5,
             "retry.backoff.ms":   300,
         })

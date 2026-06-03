@@ -242,6 +242,56 @@ docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
 
 ---
 
+## Exactly-Once Semantics — Vérification (Issue #16)
+
+### Architecture EOS bout-en-bout
+
+```
+Simulateur P2P                  Kafka Broker               Spark Streaming
+──────────────                  ────────────               ───────────────
+transactional.id=p2p-sim-1  →  topic listening_events  →  isolation.level=read_committed
+enable.idempotence=True                                     checkpoint sur /tmp ou s3a://
+acks=all
+```
+
+### Procédure de vérification après redémarrage
+
+```bash
+# 1. Avant arrêt : noter le COUNT
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_ids FROM listening_events;"
+
+# 2. Arrêter le job Spark (simuler une panne)
+docker compose stop spark-master
+
+# 3. Attendre 2 minutes (les events continuent d'arriver dans Kafka)
+sleep 120
+
+# 4. Relancer Spark (reprend depuis le checkpoint)
+docker compose start spark-master
+
+# 5. Après reprise : vérifier l'absence de doublons
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*) - COUNT(DISTINCT id) AS doublons FROM listening_events;"
+# → DOIT retourner 0
+
+# 6. Vérifier que les events publiés pendant l'arrêt ont bien été traités
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_ids FROM listening_events;"
+# → total doit avoir augmenté vs étape 1, unique_ids == total (pas de doublons)
+```
+
+### Garanties configurées
+
+| Composant | Config | Garantie |
+|---|---|---|
+| Simulateur (Kafka producer) | `enable.idempotence=True`, `acks=all`, `transactional.id=p2p-simulator-1` | Exactly-once en production |
+| Spark consumer | `isolation.level=read_committed` | Ne lit que les transactions committées |
+| Spark checkpoint | `/tmp/...` ou `s3a://spotify-checkpoints/` | Reprise sans relecture |
+| PostgreSQL sink | `ON CONFLICT (id) DO NOTHING` | Idempotence de l'écriture |
+
+---
+
 ## Chaos Engineering — Résultats (Issue #25)
 
 > À compléter lors des tests de chaos engineering.
