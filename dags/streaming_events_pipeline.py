@@ -7,12 +7,15 @@ les valide, les enrichit avec le catalogue et les stocke.
 Planification : toutes les 5 minutes
 Catchup       : désactivé (micro-batch temps réel)
 
-Architecture :
+Architecture (2 branches après validate_events) :
     Redis LIST listening_events_queue + p2p_network_events_queue
         → consume_from_redis()
-        → validate_events()          ← invalides → DLQ
-        → enrich_events()            ← jointure catalogue PostgreSQL
-        → [store_to_parquet, upsert_to_postgres]  ← branches parallèles
+        → validate_events()
+              ├─ Branche listening → enrich_events()
+              │       ├─ store_to_parquet()      (MinIO spotify-parquet/listening_events/)
+              │       └─ upsert_to_postgres()    (table listening_events)
+              └─ Branche P2P      → store_p2p_to_parquet()
+                                                 (MinIO spotify-parquet/p2p_network_events/)
 """
 
 import io
@@ -290,6 +293,59 @@ with DAG(
         logger.info("Stored %d partition(s) to MinIO", len(paths))
         return str(paths)
 
+    @task(task_id="store_p2p_to_parquet")
+    def store_p2p_to_parquet(validated: dict, **context) -> str:
+        """
+        Branche P2P : sauvegarde les p2p_network_events validés en Parquet sur MinIO.
+        Partitionnement séparé : s3://spotify-parquet/p2p_network_events/date=.../hour=.../
+
+        Returns:
+            str: liste des chemins S3 écrits (ou "no_events")
+        """
+        import boto3
+        import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        logger = logging.getLogger(__name__)
+
+        p2p_events = validated.get("valid_p2p", [])
+        if not p2p_events:
+            logger.info("No p2p events to store.")
+            return "no_events"
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get("MINIO_ENDPOINT", "http://minio:9000"),
+            aws_access_key_id=os.environ.get("MINIO_ACCESS_KEY", "minioadmin"),
+            aws_secret_access_key=os.environ.get("MINIO_SECRET_KEY", "minioadmin"),
+        )
+
+        dag_run = context["dag_run"]
+        run_id  = dag_run.run_id.replace(":", "_").replace("+", "_").replace(" ", "_")
+
+        df = pd.DataFrame(p2p_events)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df["_date"]     = df["timestamp"].dt.strftime("%Y-%m-%d")
+        df["_hour"]     = df["timestamp"].dt.hour
+
+        paths = []
+        for (date, hour), group in df.groupby(["_date", "_hour"]):
+            export = group.drop(columns=["_date", "_hour"]).copy()
+            export["timestamp"] = export["timestamp"].astype(str)
+            table = pa.Table.from_pandas(export, preserve_index=False)
+
+            buf = io.BytesIO()
+            pq.write_table(table, buf)
+            buf.seek(0)
+
+            key = f"p2p_network_events/date={date}/hour={int(hour):02d}/part-{run_id}.parquet"
+            s3.upload_fileobj(buf, "spotify-parquet", key)
+            paths.append(f"s3://spotify-parquet/{key}")
+
+        logger.info("P2P stored — %d partition(s) to MinIO", len(paths))
+        return str(paths)
+
     @task(task_id="upsert_to_postgres")
     def upsert_to_postgres(enriched_events: list, **context) -> dict:
         """
@@ -349,10 +405,13 @@ with DAG(
         return {"inserted": inserted, "skipped": skipped}
 
     # ── Orchestration ─────────────────────────────────────────
-    raw      = consume_from_redis()
+    raw       = consume_from_redis()
     validated = validate_events(raw)
-    enriched  = enrich_events(validated)
 
-    # Branches parallèles : Parquet + PostgreSQL
+    # Branche listening : enrichissement → Parquet + PostgreSQL
+    enriched = enrich_events(validated)
     store_to_parquet(enriched)
     upsert_to_postgres(enriched)
+
+    # Branche P2P : stockage direct en Parquet (pas de jointure catalogue)
+    store_p2p_to_parquet(validated)
