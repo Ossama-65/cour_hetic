@@ -47,8 +47,10 @@ POSTGRES_PROPS   = {
 }
 
 # Trigger mode : "processingTime" (continu) ou "once" (one-shot)
-TRIGGER_MODE = os.getenv("SPARK_TRIGGER_MODE", "processingTime")
+TRIGGER_MODE     = os.getenv("SPARK_TRIGGER_MODE",     "processingTime")
 TRIGGER_INTERVAL = os.getenv("SPARK_TRIGGER_INTERVAL", "10 seconds")
+WATERMARK_DELAY  = os.getenv("SPARK_WATERMARK_DELAY",  "10 minutes")
+LATE_EVENTS_TOPIC = "late_listening_events"
 
 # ─────────────────────────────────────────────────────────────
 # SCHÉMA DES ÉVÉNEMENTS D'ÉCOUTE
@@ -138,6 +140,46 @@ def read_kafka_stream(spark: SparkSession):
     return events_df
 
 
+def route_late_events(events_df):
+    """
+    Route les events tardifs (> WATERMARK_DELAY avant NOW) vers le topic
+    `late_listening_events` Kafka pour retraitement par Airflow.
+
+    Un event est considéré tardif si son event_time est plus ancien que
+    le délai watermark par rapport à l'heure Kafka de réception.
+    """
+    from pyspark.sql.functions import current_timestamp, expr
+
+    late_df = events_df.filter(
+        F.col("event_time") < (F.col("kafka_timestamp") - expr(f"INTERVAL {WATERMARK_DELAY}"))
+    )
+
+    def write_late_to_kafka(batch_df, batch_id):
+        if batch_df.isEmpty():
+            return
+        batch_df.select(
+            F.to_json(F.struct(
+                "event_id", "user_id", "track_id", "timestamp",
+                "duration_ms", "device_type", "geo_country",
+                "completed", "event_source",
+            )).alias("value")
+        ).write.format("kafka") \
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
+            .option("topic", LATE_EVENTS_TOPIC) \
+            .save()
+        print(f"[Batch {batch_id}] {batch_df.count()} late events routed → {LATE_EVENTS_TOPIC}")
+
+    query = (
+        late_df.writeStream
+        .outputMode("append")
+        .foreachBatch(write_late_to_kafka)
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/late_events")
+        .trigger(processingTime=TRIGGER_INTERVAL)
+        .start()
+    )
+    return query
+
+
 # ─────────────────────────────────────────────────────────────
 # AGRÉGATIONS STREAMING
 # ─────────────────────────────────────────────────────────────
@@ -217,26 +259,22 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
 
     print("=" * 60)
-    print("Démarrage streaming_trends_job (Issue #13 — console sink)")
-    print(f"Kafka : {KAFKA_BOOTSTRAP} → topic : {KAFKA_TOPIC}")
-    print(f"Checkpoint : {CHECKPOINT_PATH}")
-    print(f"Trigger : {TRIGGER_MODE} / {TRIGGER_INTERVAL}")
+    print("streaming_trends_job — watermarking + late events (issue #15)")
+    print(f"Kafka     : {KAFKA_BOOTSTRAP} → {KAFKA_TOPIC}")
+    print(f"Watermark : {WATERMARK_DELAY}")
+    print(f"Trigger   : {TRIGGER_INTERVAL}")
+    print(f"Late topic: {LATE_EVENTS_TOPIC}")
     print("=" * 60)
 
-    # Lecture Kafka
     events_df = read_kafka_stream(spark)
 
-    # Affichage des events bruts
-    query_raw = stream_raw_events_console(events_df)
+    # Routing des late events → late_listening_events topic
+    query_late = route_late_events(events_df)
 
-    # Top tracks par fenêtre tumbling (console)
+    # Top tracks (console sink pour validation)
     query_top = compute_top_tracks_tumbling(events_df)
 
-    print("Streaming lancé — attend les events Kafka...")
-    print("Kafka UI : http://localhost:8090")
-    print("Spark UI  : http://localhost:8888")
-
-    # Attendre l'arrêt gracieux
+    print("Streaming lancé | Kafka UI: http://localhost:8090 | Spark UI: http://localhost:8888")
     spark.streams.awaitAnyTermination()
 
 
