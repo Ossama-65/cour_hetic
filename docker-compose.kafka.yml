@@ -38,6 +38,8 @@ services:
       CLUSTER_ID: uTeNd1K8Q3iE1D1u86qa7w
     volumes:
       - kafka-2-data:/var/lib/kafka/data
+    ports:
+      - "9094:9094"
 
   kafka-3:
     image: confluentinc/cp-kafka:7.6.0
@@ -53,6 +55,8 @@ services:
       CLUSTER_ID: uTeNd1K8Q3iE1D1u86qa7w
     volumes:
       - kafka-3-data:/var/lib/kafka/data
+    ports:
+      - "9096:9096"
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest

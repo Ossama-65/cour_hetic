@@ -9,9 +9,6 @@ Usage :
     python -m src.p2p_simulator.simulator --peers 10 --rate 5
     python -m src.p2p_simulator.simulator --mode fraud --peers 5
     python -m src.p2p_simulator.simulator --mode late_events
-
-TODO Phase 1 :  Compléter _generate_listening_event() et _publish_to_redis()
-TODO Phase 2 :  Activer _publish_to_kafka() et le mode fraude
 """
 
 import argparse
@@ -22,12 +19,9 @@ import signal
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 
 import redis
-
-# Phase 2 — décommenter quand Kafka est prêt
-# from confluent_kafka import Producer
+from confluent_kafka import Producer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,17 +34,17 @@ logger = logging.getLogger("p2p_simulator")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-REDIS_URL = "redis://localhost:6379/1"
-KAFKA_BOOTSTRAP = "kafka-1:9092"       # Phase 2
+REDIS_URL        = "redis://localhost:6379/1"
+KAFKA_BOOTSTRAP  = "localhost:9092"
 
 TOPICS = {
     "listening":   "listening_events",
     "p2p_network": "p2p_network_events",
 }
 
-DEVICE_TYPES = ["mobile", "desktop", "smart_speaker", "web", "tv"]
+DEVICE_TYPES  = ["mobile", "desktop", "smart_speaker", "web", "tv"]
 GEO_COUNTRIES = ["FR", "DE", "US", "GB", "ES", "IT", "BR", "JP", "KR", "AU"]
-EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]  # pondéré : 60% P2P
+EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -58,7 +52,6 @@ EVENT_SOURCES = ["p2p", "p2p", "p2p", "direct", "cache"]  # pondéré : 60% P2P
 # ─────────────────────────────────────────────────────────────
 
 def _load_catalog_from_db():
-    """Charge les vrais tracks et users depuis PostgreSQL."""
     try:
         import psycopg2
         conn = psycopg2.connect(
@@ -83,18 +76,12 @@ SAMPLE_TRACKS = _load_catalog_from_db()
 SAMPLE_USERS  = [str(uuid.uuid4()) for _ in range(200)]
 SAMPLE_PEERS  = [str(uuid.uuid4()) for _ in range(20)]
 
+
 # ─────────────────────────────────────────────────────────────
 # SIMULATEUR PRINCIPAL
 # ─────────────────────────────────────────────────────────────
 
 class P2PSimulator:
-    """
-    Simulateur du réseau P2P SPOTIFY.
-
-    Génère deux types d'événements :
-    - listening_events   : un utilisateur écoute un morceau via un peer
-    - p2p_network_events : connexion/déconnexion/transfert entre peers
-    """
 
     def __init__(
         self,
@@ -108,13 +95,9 @@ class P2PSimulator:
         self.running = True
         self.event_count = 0
 
-        # Connexion Redis
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+        self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
 
-        # Phase 2 — Kafka producer
-        # self.kafka_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
-
-        # Peers actifs simulés
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
 
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -123,7 +106,6 @@ class P2PSimulator:
         logger.info(f"Simulateur démarré | mode={mode} | peers={n_peers} | rate={events_per_second} evt/s")
 
     def run(self):
-        """Boucle principale : génère et publie des événements en continu."""
         interval = 1.0 / self.events_per_second
 
         while self.running:
@@ -145,8 +127,6 @@ class P2PSimulator:
             except Exception as e:
                 logger.error(f"Erreur lors de la génération d'événement : {e}")
                 time.sleep(1)
-
-    # ── Génération d'événements ──────────────────────────────
 
     def _generate_listening_event(self) -> dict:
         track       = random.choice(SAMPLE_TRACKS)
@@ -200,32 +180,34 @@ class P2PSimulator:
 
         return event
 
-    # ── Publication ──────────────────────────────────────────
-
     def _publish_event(self, topic_key: str, event: dict):
-        """Publie un événement dans Redis et (Phase 2) dans Kafka."""
         payload = json.dumps(event)
         channel = TOPICS[topic_key]
         self._publish_to_redis(channel, payload)
-        # Phase 2 — décommenter
-        # self._publish_to_kafka(channel, event.get("user_id", ""), payload)
+        self._publish_to_kafka(channel, event.get("user_id", ""), payload)
 
     def _publish_to_redis(self, channel: str, payload: str):
         try:
-            # Pub/sub (temps réel)
             self.redis.publish(channel, payload)
-            # Liste buffer (pour le DAG Airflow)
             self.redis.lpush(f"{channel}:buffer", payload)
-            # Garder max 10 000 events dans le buffer
             self.redis.ltrim(f"{channel}:buffer", 0, 9999)
         except Exception as e:
             logger.error(f"Erreur Redis publish sur '{channel}': {e}")
 
-    # def _publish_to_kafka(self, topic: str, key: str, payload: str):
-    #     raise NotImplementedError("TODO Phase 2 : implémenter _publish_to_kafka()")
+    def _publish_to_kafka(self, topic: str, key: str, payload: str):
+        try:
+            self.kafka_producer.produce(
+                topic,
+                key=key.encode("utf-8"),
+                value=payload.encode("utf-8")
+            )
+            self.kafka_producer.poll(0)
+        except Exception as e:
+            logger.error(f"Erreur Kafka produce sur '{topic}': {e}")
 
     def _shutdown(self, signum, frame):
         logger.info(f"Arrêt du simulateur (signal {signum}) — {self.event_count} événements publiés")
+        self.kafka_producer.flush()
         self.running = False
 
 
@@ -235,9 +217,9 @@ class P2PSimulator:
 
 def main():
     parser = argparse.ArgumentParser(description="SPOTIFY P2P Simulator")
-    parser.add_argument("--peers",  type=int,   default=10,     help="Nombre de peers simulés")
-    parser.add_argument("--rate",   type=float, default=5.0,    help="Événements par seconde")
-    parser.add_argument("--mode",   type=str,   default="normal",
+    parser.add_argument("--peers", type=int,   default=10,    help="Nombre de peers simulés")
+    parser.add_argument("--rate",  type=float, default=5.0,   help="Événements par seconde")
+    parser.add_argument("--mode",  type=str,   default="normal",
                         choices=["normal", "fraud", "late_events", "chaos"],
                         help="Mode de simulation")
     args = parser.parse_args()
