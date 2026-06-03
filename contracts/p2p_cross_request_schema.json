@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "P2PCrossGroupRequest",
+  "description": "Format d'une requête P2P cross-groupe — v1.0",
+  "version": "1.0",
+  "type": "object",
+  "required": ["request_id", "requester_group", "target_group", "track_id", "peer_endpoint", "timestamp", "schema_version"],
+  "properties": {
+    "request_id":       { "type": "string", "format": "uuid" },
+    "requester_group":  { "type": "string", "pattern": "^groupe-[a-z]$" },
+    "target_group":     { "type": "string", "pattern": "^groupe-[a-z]$" },
+    "track_id":         { "type": "string", "format": "uuid" },
+    "peer_endpoint":    { "type": "string", "description": "Adresse du peer qui fait la demande" },
+    "user_id":          { "type": ["string", "null"], "format": "uuid" },
+    "timestamp":        { "type": "string", "format": "date-time" },
+    "status":           { "type": "string", "enum": ["pending", "fulfilled", "rejected"], "default": "pending" },
+    "response_url":     { "type": ["string", "null"], "description": "URL de réponse pour la livraison du chunk" },
+    "schema_version":   { "type": "string", "const": "1.0" }
+  },
+  "additionalProperties": false
+}

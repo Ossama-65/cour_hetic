@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CatalogFederationTrack",
+  "description": "Format d'un track fédéré entre groupes SPOTIFY — v1.0",
+  "version": "1.0",
+  "type": "object",
+  "required": ["track_id", "source_group", "artist_name", "track_title", "duration_ms", "schema_version"],
+  "properties": {
+    "track_id":        { "type": "string", "format": "uuid" },
+    "source_group":    { "type": "string", "pattern": "^groupe-[a-z]$", "description": "Groupe émetteur (ex: groupe-c)" },
+    "artist_name":     { "type": "string", "minLength": 1, "maxLength": 255 },
+    "track_title":     { "type": "string", "minLength": 1, "maxLength": 255 },
+    "duration_ms":     { "type": "integer", "minimum": 1, "maximum": 3600000 },
+    "genre":           { "type": ["string", "null"], "enum": ["Pop","Rock","Hip-Hop","Electronic","Jazz","R&B","Folk","Latin","Metal","Classical", null] },
+    "audio_peer_endpoint": { "type": ["string", "null"], "description": "Endpoint P2P pour télécharger le morceau" },
+    "published_at":    { "type": "string", "format": "date-time" },
+    "schema_version":  { "type": "string", "const": "1.0" }
+  },
+  "additionalProperties": false
+}

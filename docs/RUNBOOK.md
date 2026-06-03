@@ -242,21 +242,108 @@ docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
 
 ---
 
-## Chaos Engineering — Résultats (Issue #25)
+## Chaos Engineering — Scénarios et procédures (Issue #25)
 
-> À compléter lors des tests de chaos engineering.
+### Comment lancer les tests
 
-### Scénario 1 : Arrêt d'un broker Kafka
-**Commande :** `docker compose stop kafka-2`
-**Comportement observé :** ...
-**Recovery automatique :** oui / non — détails : ...
+```bash
+# Avant chaque test : noter les compteurs de référence
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*) AS events, COUNT(DISTINCT id) AS unique_events FROM listening_events;"
 
-### Scénario 2 : Kill du driver Spark
-**Commande :** `docker compose kill spark-master`
-**Recovery depuis checkpoint :** oui / non — détails : ...
-**Doublons introduits :** 0 / N — vérification : ...
+docker exec cours_hetic-kafka-1-1 kafka-consumer-groups \
+  --bootstrap-server kafka-1:9092 --group spark-streaming-trends --describe
+```
 
-### Scénario 3 : Coupure PostgreSQL 2 minutes
-**Commande :** `docker compose stop postgres` → 2min → `docker compose start postgres`
-**Comportement observé (Airflow) :** ...
-**Données perdues :** oui / non — détails : ...
+---
+
+### Scénario 1 : Arrêt d'un broker Kafka (cluster reste opérationnel)
+
+**Objectif :** Vérifier que le cluster survit avec 2 brokers sur 3.
+
+**Commande :**
+```bash
+docker compose stop kafka-2
+# Attendre 30 secondes
+docker exec cours_hetic-kafka-1-1 kafka-broker-api-versions \
+  --bootstrap-server kafka-1:9092  # Doit répondre même sans kafka-2
+
+# Recovery
+docker compose start kafka-2
+```
+
+**Comportement attendu :**
+- Le cluster continue de fonctionner (RF=3, min.insync.replicas=2 → 2 ISR suffisent)
+- Le simulateur continue de publier (acks=all avec 2 ISR)
+- Spark streaming continue de consommer
+
+**Vérification :**
+```bash
+docker exec cours_hetic-kafka-1-1 kafka-topics --describe \
+  --topic listening_events --bootstrap-server kafka-1:9092
+# → ISR doit montrer 2 brokers actifs
+```
+
+---
+
+### Scénario 2 : Kill du driver Spark (reprise depuis checkpoint)
+
+**Objectif :** Vérifier la reprise sans perte ni doublon après un crash Spark.
+
+**Commande :**
+```bash
+# 1. Avant : noter le COUNT
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*), COUNT(DISTINCT id) FROM listening_events;"
+
+# 2. Tuer Spark
+docker compose kill spark-master
+
+# 3. Attendre 2 minutes (events s'accumulent dans Kafka)
+sleep 120
+
+# 4. Relancer Spark (reprend depuis le checkpoint)
+docker compose start spark-master
+
+# 5. Vérifier l'absence de doublons après reprise
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*) - COUNT(DISTINCT id) AS doublons FROM listening_events;"
+# → DOIT retourner 0
+```
+
+**Comportement attendu :**
+- Le job Spark redémarre depuis le checkpoint (offset Kafka repris)
+- Tous les events accumulés pendant l'arrêt sont traités
+- 0 doublon (ON CONFLICT DO NOTHING + exactly-once Kafka)
+
+---
+
+### Scénario 3 : Coupure PostgreSQL 2 minutes (recovery sans perte)
+
+**Objectif :** Vérifier que les DAGs Airflow et Spark gèrent une indisponibilité PostgreSQL.
+
+**Commande :**
+```bash
+docker compose stop postgres
+sleep 120  # 2 minutes d'indisponibilité
+docker compose start postgres
+
+# Vérifier que PostgreSQL est revenu healthy
+docker compose ps postgres  # → (healthy)
+```
+
+**Comportement attendu (Airflow) :**
+- Les tâches en cours échouent avec `OperationalError`
+- Airflow retente automatiquement (retries=2-3 configurés)
+- Après recovery de PostgreSQL, les retries réussissent
+
+**Comportement attendu (Spark) :**
+- Le job Spark peut continuer à agréger en mémoire (windowed aggregations)
+- L'écriture via foreachBatch échoue temporairement
+- Au retry, les données sont réécrites (idempotence via ON CONFLICT)
+
+**Vérification :**
+```bash
+docker exec cours_hetic-postgres-1 psql -U spotify -d spotify -c \
+  "SELECT COUNT(*) AS events FROM listening_events;"
+# Doit correspondre au COUNT avant la coupure (pas de perte)

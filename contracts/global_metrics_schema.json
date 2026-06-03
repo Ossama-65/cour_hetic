@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GlobalMetrics",
+  "description": "Format des métriques partagées pour le Top 50 Global — v1.0",
+  "version": "1.0",
+  "type": "object",
+  "required": ["source_group", "date", "top_tracks", "schema_version"],
+  "properties": {
+    "source_group": { "type": "string", "pattern": "^groupe-[a-z]$" },
+    "date":         { "type": "string", "format": "date" },
+    "published_at": { "type": "string", "format": "date-time" },
+    "top_tracks": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "required": ["track_id", "artist_name", "track_title", "stream_count"],
+        "properties": {
+          "track_id":    { "type": "string", "format": "uuid" },
+          "artist_name": { "type": "string" },
+          "track_title": { "type": "string" },
+          "stream_count":     { "type": "integer", "minimum": 0 },
+          "unique_listeners": { "type": "integer", "minimum": 0 },
+          "genre":            { "type": ["string", "null"] }
+        }
+      }
+    },
+    "total_streams":      { "type": "integer", "minimum": 0 },
+    "active_peers":       { "type": "integer", "minimum": 0 },
+    "cache_hit_rate":     { "type": "number", "minimum": 0, "maximum": 1 },
+    "schema_version":     { "type": "string", "const": "1.0" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,43 @@
+# Configuration P2P inter-groupes SPOTIFY
+# Utilisé par le simulateur et les DAGs Phase 3
+
+group_id: groupe-c
+bootstrap_servers: kafka-1:9092,kafka-2:9094,kafka-3:9096
+
+# Topics partagés inter-groupes
+shared_topics:
+  catalog_federation:
+    partitions: 6
+    replication_factor: 3
+    description: "Partage des catalogues musicaux entre groupes"
+
+  p2p_cross_requests:
+    partitions: 6
+    replication_factor: 3
+    description: "Requêtes P2P cross-groupe (track non disponible localement)"
+
+  global_metrics:
+    partitions: 6
+    replication_factor: 3
+    description: "Métriques agrégées de chaque groupe pour le Top 50 Global"
+
+# Endpoints des autres groupes (à remplir lors de la soutenance)
+other_groups:
+  # groupe-a:
+  #   bootstrap: kafka-a:9092
+  #   peer_endpoint: http://groupe-a-peer:8000
+  # groupe-b:
+  #   bootstrap: kafka-b:9092
+  #   peer_endpoint: http://groupe-b-peer:8000
+
+# Paramètres producteur exactly-once
+producer_config:
+  acks: all
+  enable_idempotence: true
+  retries: 5
+
+# Paramètres consommateur
+consumer_config:
+  isolation_level: read_committed
+  auto_offset_reset: earliest
+  enable_auto_commit: false
