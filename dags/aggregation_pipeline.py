@@ -36,7 +36,9 @@ Attend le dernier run réussi de `streaming_events_pipeline` via ExternalTaskSen
 - Table `artist_stats`   : streams + unique listeners par artiste par jour
 
 ### Stratégie
-Incrémentale : calcule uniquement pour `data_interval_start.date()`.
+Fenêtre glissante : calcule les agrégats pour toutes les dates des 30 derniers jours
+qui ont des données dans `listening_events`. Évite les problèmes de décalage entre
+la date d'exécution Airflow et la date réelle des événements.
 Idempotente  : INSERT ... ON CONFLICT (track_id, date) DO UPDATE SET ...
 """
 
@@ -50,6 +52,7 @@ DEFAULT_ARGS = {
 }
 
 POSTGRES_CONN_ID = "spotify_postgres"
+LOOKBACK_DAYS    = 30  # fenêtre glissante : agrège toutes les dates ayant des données
 
 
 def _get_latest_streaming_run(dt):
@@ -100,14 +103,14 @@ with DAG(
     @task(task_id="compute_top_tracks")
     def compute_top_tracks(**context) -> list:
         """
-        Calcule le top 50 des tracks pour la date d'exécution (data_interval_start).
-        Filtre sur completed=TRUE pour ne compter que les vraies écoutes.
+        Calcule le top 50 des tracks par date sur les LOOKBACK_DAYS derniers jours.
+        Utilise toutes les dates réellement présentes dans listening_events
+        (pas la date d'exécution Airflow) pour éviter les décalages de schedule.
 
         Returns:
-            list[dict]: agrégats par track_id pour la date courante
+            list[dict]: agrégats par (track_id, date) pour les 30 derniers jours
         """
         logger = logging.getLogger(__name__)
-        exec_date = context["data_interval_start"].date()
 
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         conn = hook.get_conn()
@@ -115,48 +118,56 @@ with DAG(
 
         cur.execute("""
             SELECT
+                DATE(le.timestamp)                 AS jour,
                 le.track_id::text,
                 COUNT(*)                           AS total_streams,
                 COUNT(DISTINCT le.user_id)         AS unique_listeners,
                 COALESCE(SUM(le.duration_ms), 0)   AS total_duration_ms,
                 ARRAY_AGG(DISTINCT le.geo_country) AS countries
             FROM listening_events le
-            WHERE DATE(le.timestamp) = %s
+            WHERE le.timestamp >= NOW() - INTERVAL '%s days'
               AND le.completed = TRUE
-            GROUP BY le.track_id
-            ORDER BY total_streams DESC
-            LIMIT 50
-        """, (exec_date,))
+            GROUP BY DATE(le.timestamp), le.track_id
+            ORDER BY DATE(le.timestamp) DESC, total_streams DESC
+        """, (LOOKBACK_DAYS,))
 
         rows = cur.fetchall()
         cur.close()
         conn.close()
 
-        result = [
-            {
-                "track_id":         r[0],
-                "total_streams":    r[1],
-                "unique_listeners": r[2],
-                "total_duration_ms": r[3],
-                "countries":        r[4] or [],
-                "date":             str(exec_date),
-            }
-            for r in rows
-        ]
-        logger.info("Top tracks pour %s : %d tracks trouvés", exec_date, len(result))
+        # Garder le top 50 par date
+        from collections import defaultdict
+        by_date: dict = defaultdict(list)
+        for r in rows:
+            by_date[str(r[0])].append(r)
+
+        result = []
+        for date_str, date_rows in by_date.items():
+            for r in date_rows[:50]:
+                result.append({
+                    "track_id":          r[1],
+                    "total_streams":     r[2],
+                    "unique_listeners":  r[3],
+                    "total_duration_ms": r[4],
+                    "countries":         r[5] or [],
+                    "date":              date_str,
+                })
+
+        logger.info(
+            "Top tracks sur %d jours : %d entrées (dates: %s)",
+            LOOKBACK_DAYS, len(result), list(by_date.keys()),
+        )
         return result
 
     @task(task_id="compute_artist_stats")
     def compute_artist_stats(**context) -> list:
         """
-        Calcule les statistiques par artiste pour la date d'exécution.
-        Jointure listening_events × tracks pour récupérer l'artist_id.
+        Calcule les statistiques par artiste par date sur les LOOKBACK_DAYS derniers jours.
 
         Returns:
-            list[dict]: stats par artiste pour la date courante
+            list[dict]: stats par (artist_id, date)
         """
         logger = logging.getLogger(__name__)
-        exec_date = context["data_interval_start"].date()
 
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         conn = hook.get_conn()
@@ -164,6 +175,7 @@ with DAG(
 
         cur.execute("""
             SELECT
+                DATE(le.timestamp)         AS jour,
                 t.artist_id::text,
                 COUNT(*)                   AS total_streams,
                 COUNT(DISTINCT le.user_id) AS unique_listeners,
@@ -172,7 +184,7 @@ with DAG(
                     FROM listening_events le2
                     JOIN tracks t2 ON le2.track_id = t2.id
                     WHERE t2.artist_id = t.artist_id
-                      AND DATE(le2.timestamp) = %s
+                      AND DATE(le2.timestamp) = DATE(le.timestamp)
                       AND le2.completed = TRUE
                     GROUP BY le2.track_id
                     ORDER BY COUNT(*) DESC
@@ -180,11 +192,11 @@ with DAG(
                 ) AS top_track_id
             FROM listening_events le
             JOIN tracks t ON le.track_id = t.id
-            WHERE DATE(le.timestamp) = %s
+            WHERE le.timestamp >= NOW() - INTERVAL '%s days'
               AND le.completed = TRUE
-            GROUP BY t.artist_id
-            ORDER BY total_streams DESC
-        """, (exec_date, exec_date))
+            GROUP BY DATE(le.timestamp), t.artist_id
+            ORDER BY DATE(le.timestamp) DESC, total_streams DESC
+        """, (LOOKBACK_DAYS,))
 
         rows = cur.fetchall()
         cur.close()
@@ -192,30 +204,26 @@ with DAG(
 
         result = [
             {
-                "artist_id":        r[0],
-                "total_streams":    r[1],
-                "unique_listeners": r[2],
-                "top_track_id":     r[3],
-                "date":             str(exec_date),
+                "artist_id":        r[1],
+                "total_streams":    r[2],
+                "unique_listeners": r[3],
+                "top_track_id":     r[4],
+                "date":             str(r[0]),
             }
             for r in rows
         ]
-        logger.info("Artist stats pour %s : %d artistes", exec_date, len(result))
+        logger.info("Artist stats sur %d jours : %d entrées", LOOKBACK_DAYS, len(result))
         return result
 
     @task(task_id="compute_p2p_metrics")
     def compute_p2p_metrics(**context) -> dict:
         """
-        Calcule les métriques du réseau P2P pour la date d'exécution :
-        - Taux de cache_hit (event_source='cache' / total)
-        - Nombre de peers uniques actifs (source_peer_id)
-        - Distribution device_type et geo_country
+        Calcule les métriques P2P agrégées sur les LOOKBACK_DAYS derniers jours.
 
         Returns:
-            dict: métriques P2P agrégées
+            dict: métriques globales sur la fenêtre glissante
         """
         logger = logging.getLogger(__name__)
-        exec_date = context["data_interval_start"].date()
 
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         conn = hook.get_conn()
@@ -223,23 +231,14 @@ with DAG(
 
         cur.execute("""
             SELECT
-                COUNT(*)                                                    AS total_events,
-                COUNT(*) FILTER (WHERE event_source = 'cache')             AS cache_hits,
-                COUNT(*) FILTER (WHERE event_source = 'p2p')               AS p2p_events,
-                COUNT(DISTINCT source_peer_id)                             AS active_peers,
-                AVG(duration_ms)                                           AS avg_listen_ms,
-                jsonb_object_agg(device_type, device_count) FILTER (WHERE device_type IS NOT NULL) AS device_distribution
-            FROM (
-                SELECT
-                    event_source,
-                    source_peer_id,
-                    duration_ms,
-                    device_type,
-                    COUNT(*) OVER (PARTITION BY device_type) AS device_count
-                FROM listening_events
-                WHERE DATE(timestamp) = %s
-            ) sub
-        """, (exec_date,))
+                COUNT(*)                                         AS total_events,
+                COUNT(*) FILTER (WHERE event_source = 'cache')  AS cache_hits,
+                COUNT(*) FILTER (WHERE event_source = 'p2p')    AS p2p_events,
+                COUNT(DISTINCT source_peer_id)                  AS active_peers,
+                AVG(duration_ms)                                AS avg_listen_ms
+            FROM listening_events
+            WHERE timestamp >= NOW() - INTERVAL '%s days'
+        """, (LOOKBACK_DAYS,))
 
         row = cur.fetchone()
         cur.close()
@@ -247,7 +246,7 @@ with DAG(
 
         if not row or row[0] == 0:
             metrics = {
-                "date": str(exec_date),
+                "window_days": LOOKBACK_DAYS,
                 "total_events": 0,
                 "cache_hit_rate": 0.0,
                 "p2p_rate": 0.0,
@@ -257,7 +256,7 @@ with DAG(
         else:
             total = row[0] or 1
             metrics = {
-                "date":           str(exec_date),
+                "window_days":    LOOKBACK_DAYS,
                 "total_events":   row[0],
                 "cache_hit_rate": round((row[1] or 0) / total, 4),
                 "p2p_rate":       round((row[2] or 0) / total, 4),
@@ -265,7 +264,7 @@ with DAG(
                 "avg_listen_ms":  round(float(row[4] or 0), 2),
             }
 
-        logger.info("P2P metrics pour %s : %s", exec_date, metrics)
+        logger.info("P2P metrics (%d jours) : %s", LOOKBACK_DAYS, metrics)
         return metrics
 
     @task(task_id="update_aggregates")
@@ -326,7 +325,7 @@ with DAG(
             "tracks_aggregated":  len(top_tracks),
             "artists_aggregated": len(artist_stats),
             "p2p_cache_hit_rate": p2p_metrics.get("cache_hit_rate", 0),
-            "date":               p2p_metrics.get("date"),
+            "window_days":        p2p_metrics.get("window_days", LOOKBACK_DAYS),
         }
 
         if top_tracks:
