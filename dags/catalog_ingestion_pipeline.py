@@ -163,8 +163,8 @@ with DAG(
                     valid_entries["artists"].append(artist)
                 else:
                     errors_count += 1
-                    hook.run("INSERT INTO dead_letter_events (payload, error_type) VALUES (%s, %s)", 
-                             parameters=(json.dumps(artist), "schema_validation_artist"))
+                    hook.run("INSERT INTO dead_letter_events (payload, error_type, original_topic) VALUES (%s, %s, %s)", 
+                             parameters=(json.dumps(artist), "schema_validation_artist", "catalog_ingestion"))
 
             # Validation Albums
             for album in catalog.get("albums", []):
@@ -172,8 +172,8 @@ with DAG(
                     valid_entries["albums"].append(album)
                 else:
                     errors_count += 1
-                    hook.run("INSERT INTO dead_letter_events (payload, error_type) VALUES (%s, %s)", 
-                             parameters=(json.dumps(album), "schema_validation_album"))
+                    hook.run("INSERT INTO dead_letter_events (payload, error_type, original_topic) VALUES (%s, %s, %s)", 
+                             parameters=(json.dumps(album), "schema_validation_album", "catalog_ingestion"))
 
             # Validation Tracks
             for track in catalog.get("tracks", []):
@@ -181,8 +181,8 @@ with DAG(
                     valid_entries["tracks"].append(track)
                 else:
                     errors_count += 1
-                    hook.run("INSERT INTO dead_letter_events (payload, error_type) VALUES (%s, %s)", 
-                             parameters=(json.dumps(track), "schema_validation_track"))
+                    hook.run("INSERT INTO dead_letter_events (payload, error_type, original_topic) VALUES (%s, %s, %s)", 
+                             parameters=(json.dumps(track), "schema_validation_track", "catalog_ingestion"))
                              
         return {"valid": valid_entries, "errors_count": errors_count}
 
