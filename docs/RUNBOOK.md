@@ -1,277 +1,49 @@
-# RUNBOOK — Spotify Data Platform
-## Groupe D — M1 Data & IA — Juin 2026
+# RUNBOOK — Incidents & procédures
 
----
+## Incidents rencontrés pendant le projet
 
-## Environnement
+### Port 8080 occupé au démarrage
+Symptôme : "Bind for 0.0.0.0:8080 failed: port is already allocated"
+Cause : un autre processus occupait le port sur la machine hôte
+Résolution : lsof -i :8080 pour identifier, kill du processus, puis docker compose down && docker compose up -d
 
-| Service       | URL                        | Credentials                  |
-|---------------|----------------------------|------------------------------|
-| Airflow UI    | http://localhost:8080       | admin / admin                |
-| MinIO UI      | http://localhost:9001       | minioadmin / minioadmin      |
-| Kafka UI      | http://localhost:8090       | Phase 2 uniquement           |
-| Spark UI      | http://localhost:8888       | Phase 2 uniquement           |
-| PostgreSQL    | localhost:5432              | spotify / spotify            |
-| Redis         | localhost:6379              | —                            |
+### Port 6379 occupé (Redis)
+Même problème que le 8080 mais sur Redis.
+Résolution : lsof -i :6379, kill, relance.
 
----
+### Mauvais dossier de projet
+Symptôme : airflow-init exit 127, docker-compose.yml incorrect
+Cause : lancement depuis ~/Downloads/Projects/spotify-m1 au lieu de ~/cours_hetic
+Résolution : vérifier pwd avant toute commande docker compose
 
-## Demarrage de la stack
+### scikit-learn manquant dans le conteneur
+Symptôme : ModuleNotFoundError: No module named 'sklearn' dans recommendation_pipeline
+Cause : _PIP_ADDITIONAL_REQUIREMENTS mal indenté dans docker-compose.yml
+Résolution : corriger l'indentation YAML, docker compose down && up -d
 
-### Phase 1 — Batch uniquement
+### Conflit Git sur src/transformations/
+Symptôme : CONFLICT (add/add) lors du rebase
+Cause : collègue et moi avons créé les mêmes fichiers en parallèle
+Résolution : git checkout --ours pour garder notre version, git rebase --continue
 
-```bash
-cp .env.example .env
-docker compose up -d
-sleep 60 && docker compose ps
-```
+### dlq_reprocessing_pipeline en échec
+Symptôme : NotImplementedError sur fetch_pending_dlq
+Cause : fonction non implémentée dans le fichier de base du prof
+Résolution : implémenter les 3 fonctions fetch_pending_dlq, reprocess_events, update_dlq_status
 
-### Phase 2 — Avec Kafka et Spark
+## Commandes utiles
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.kafka.yml up -d
-```
+Relancer la stack :
+docker compose down && docker compose up -d
 
-### Arreter tout
+Voir les logs d'un service :
+docker compose logs <service> -f
 
-```bash
-docker compose down
-```
+Vérifier les DAGs :
+docker compose exec airflow-scheduler airflow dags list
 
----
+Lancer les tests :
+docker compose exec airflow-worker bash -c "cd /opt/airflow && export PYTHONPATH=/opt/airflow && /home/airflow/.local/bin/pytest tests/unit/ -v"
 
-## Incidents rencontres
-
-### INC-001 — git pull bloque par modifications locales non commitees
-
-**Symptome**
-
-```
-error: Your local changes to the following files would be overwritten by merge:
-        dags/recommendation_pipeline.py
-Please commit your changes or stash them before you merge.
-Aborting
-```
-
-**Cause** : modifications locales sur un fichier modifie aussi sur la branche distante.
-
-**Resolution**
-
-Si les modifications locales ne sont pas necessaires :
-```bash
-git checkout <fichier>
-git pull origin groupe-d/main
-```
-
-Si les modifications locales doivent etre conservees :
-```bash
-git stash
-git pull origin groupe-d/main
-git stash pop
-```
-
-**Fichiers concernes** : `dags/recommendation_pipeline.py`
-
----
-
-### INC-002 — pytest introuvable sur Windows
-
-**Symptome**
-
-```
-bash: pytest: command not found
-```
-
-**Cause** : le script `pytest.exe` est installe dans un repertoire absent du PATH Windows (`C:\Users\...\Python313\Scripts`).
-
-**Resolution**
-
-```bash
-python -m pytest tests/unit/ -v --tb=short
-```
-
-Ne pas utiliser `pytest` directement sous Git Bash sur Windows.
-
----
-
-### INC-003 — pip ne peut pas installer pandas depuis les sources
-
-**Symptome**
-
-```
-ERROR: Unknown compiler(s): [['icl'], ['cl'], ['cc'], ['gcc'], ['clang'], ['clang-cl'], ['pgcc']]
-error: metadata-generation-failed
-```
-
-**Cause** : Python 3.13 + pandas 2.2.0 n'a pas de wheel precompile compatible. pip tente de compiler depuis les sources mais aucun compilateur C n'est disponible sur la machine.
-
-**Resolution**
-
-```bash
-pip install "pandas>=2.0" --only-binary=:all:
-```
-
-Ou forcer la version avec wheel disponible :
-```bash
-pip install pandas --upgrade
-```
-
----
-
-### INC-004 — test_dag_structure.py echoue au import
-
-**Symptome**
-
-```
-ModuleNotFoundError: No module named 'fcntl'
-ERROR tests/structure/test_dag_structure.py
-```
-
-**Cause** : `fcntl` est un module POSIX uniquement. Airflow ne supporte pas Windows nativement. Ce test ne peut pas s'executer hors Linux/macOS.
-
-**Resolution**
-
-Lancer uniquement les tests unitaires :
-```bash
-python -m pytest tests/unit/ -v --tb=short
-```
-
-Les tests de structure (`tests/structure/`) sont a executer dans le conteneur Docker ou sous WSL2.
-
----
-
-### INC-005 — ImportError sur src.* dans les tests
-
-**Symptome**
-
-```
-ImportError: No module named 'src'
-```
-
-**Cause** : `PYTHONPATH` n'inclut pas la racine du projet.
-
-**Resolution**
-
-```bash
-export PYTHONPATH=$(pwd)
-python -m pytest tests/unit/ -v --tb=short
-```
-
----
-
-### INC-006 — 14 tests skipped apres lancement des tests unitaires
-
-**Symptome**
-
-```
-14 skipped
-SKIPPED [1] tests\unit\test_transformations.py:86: TODO : implementer normalize_artist_name()
-```
-
-**Cause** : les fonctions `normalize_artist_name()`, `validate_track_schema()`, `is_valid_listening_event()` et `deduplicate_artists()` n'etaient pas implementees. Les tests etaient marques `@pytest.mark.skip`.
-
-**Resolution**
-
-Creer `src/transformations/catalog.py` et `src/transformations/events.py` avec les fonctions requises, puis decommenter les tests dans `tests/unit/test_transformations.py`.
-
-**Resultat apres correction** : 18 passed, 0 skipped, 0 failed.
-
----
-
-## Verification de l'etat de la plateforme
-
-### DAGs Airflow
-
-```bash
-docker exec $(docker ps -qf "name=airflow-scheduler") airflow dags list
-docker exec $(docker ps -qf "name=airflow-scheduler") airflow dags list-runs -d catalog_ingestion_pipeline
-```
-
-### PostgreSQL
-
-```bash
-psql -U spotify spotify -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"
-psql -U spotify spotify -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle';"
-psql -U spotify spotify -c "SELECT COUNT(*) FROM artists;"
-psql -U spotify spotify -c "SELECT COUNT(*) FROM tracks;"
-psql -U spotify spotify -c "SELECT status, COUNT(*) FROM dead_letter_events GROUP BY status;"
-psql -U spotify spotify -c "SELECT COUNT(*) - COUNT(DISTINCT id) AS doublons FROM listening_events;"
-```
-
-### Redis
-
-```bash
-redis-cli keys 'reco:*' | head -5
-redis-cli get reco:<user_id>
-redis-cli get top50:global | python3 -m json.tool | head -30
-```
-
-### Kafka (Phase 2)
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.kafka.yml logs kafka-1 | grep -i error
-docker exec kafka-1 kafka-topics.sh --bootstrap-server localhost:9092 --list
-```
-
----
-
-## Procedures de reset
-
-### Airflow — DAG bloque en running
-
-```bash
-docker exec $(docker ps -qf "name=airflow-scheduler") \
-  airflow tasks clear <dag_id> -t <task_id> --yes
-```
-
-### MinIO — bucket introuvable
-
-```bash
-docker compose restart minio-init
-```
-
-### Spark — OutOfMemoryError
-
-Reduire dans `docker-compose.kafka.yml` :
-```yaml
-SPARK_WORKER_MEMORY: 1G
-```
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.kafka.yml \
-  restart spark-worker-1 spark-worker-2
-```
-
-### Docker — no space left on device
-
-```bash
-docker system prune -af
-docker compose up -d
-```
-
----
-
-## Workflow Git
-
-```bash
-git pull origin groupe-d/main
-
-# Convention de commits
-feat(#10): description
-fix(#10): description
-docs(#10): description
-test(#10): description
-
-# En cas de non-fast-forward
-git pull origin groupe-d/main --rebase
-git push origin groupe-d/main
-```
-
----
-
-## Resultats des tests Phase 1
-
-| Suite                  | Passed | Skipped | Failed | Plateforme |
-|------------------------|--------|---------|--------|------------|
-| tests/unit/            | 18     | 0       | 0      | Windows    |
-| tests/structure/       | N/A    | N/A     | N/A    | Linux only |
+Lancer le simulateur P2P :
+python3 -m src.p2p_simulator.simulator --peers 10 --rate 3
