@@ -1,0 +1,30 @@
+# Configuration P2P cross-group
+# Chaque groupe déclare ses endpoints Kafka accessibles depuis l'extérieur
+
+source_group: groupe-d
+
+# Endpoints des autres groupes (à compléter avec les vraies IPs lors de la session inter-groupes)
+peers:
+  groupe-a:
+    kafka_bootstrap: "kafka-groupe-a:9092"
+    http_endpoint: "http://groupe-a:8080"
+    active: false
+
+  groupe-b:
+    kafka_bootstrap: "kafka-groupe-b:9092"
+    http_endpoint: "http://groupe-b:8080"
+    active: false
+
+  groupe-c:
+    kafka_bootstrap: "kafka-groupe-c:9092"
+    http_endpoint: "http://groupe-c:8080"
+    active: false
+
+topics:
+  outbound_requests: "p2p_cross_requests"
+  inbound_requests: "p2p_cross_requests"
+  responses: "p2p_cross_responses"
+
+timeouts:
+  request_ttl_seconds: 30
+  consumer_timeout_ms: 10000
