@@ -1,7 +1,7 @@
-# Critères de validation — Issues #1 à #5
-## Groupe D · Phase 1 — Data Pipelines Batch
+# Critères de validation — Issues #1 à #20
+## Groupe D · Phases 1, 2 et 3
 
-> Ce document recense les preuves de validation pour les 5 premières issues du projet.
+> Ce document recense les preuves de validation pour les 20 issues du projet.
 > Les screenshots sont dans `docs/screenshots/`.
 
 ---
@@ -197,144 +197,6 @@ avec les 10 champs requis : `event_id`, `user_id`, `track_id`, `source_peer`, `t
 
 ---
 
-## Résumé des validations
-
-| Issue | Titre | Critère | Statut |
-|---|---|---|---|
-| #1 | Setup Docker Compose | `docker compose ps` tous Up + Airflow UI accessible | Validé |
-| #2 | Schema PostgreSQL & ERD | 13 tables + `DATA_MODEL.md` complété | Validé |
-| #3 | Data Generator Faker | `pytest TestDataGenerator` 4 passed | Validé |
-| #4 | DAG catalog_ingestion | DAGRun vert + `pytest tests/unit/` 18 passed | Validé |
-| #5 | Simulateur P2P | `redis-cli subscribe` events JSON en continu | Validé |
-
----
-
-## Issue #16 — Exactly-once / Fix UUID cast
-
-**Objectif** : Spark écrit dans `realtime_top_tracks` sans erreur de type UUID ni duplicate key.
-
-**Fix appliqué dans `spark_jobs/streaming_trends_job.py` :**
-- `stringtype=unspecified` dans `POSTGRES_PROPS`
-- `mode="overwrite"` dans `write_to_postgres()`
-
-**Commande exécutée :**
-```bash
-docker compose exec postgres psql -U airflow -d spotify -c \
-  "SELECT COUNT(*), MIN(window_start), MAX(window_end) FROM realtime_top_tracks;"
-```
-
-**Résultat obtenu :**
-count |          min           |          max
--------+------------------------+------------------------
-602 | 2026-06-04 18:50:00+00 | 2026-06-04 19:10:00+00
-(1 row)
-
-**Screenshot :**
-
-![issue16 terminal](screenshots/issue16_17_18_terminal.png)
-*`SELECT COUNT(*) FROM realtime_top_tracks` — 602 fenêtres écrites sans erreur UUID*
-
----
-
-## Issue #17 — streaming_enrichment_job.py
-
-**Objectif** : Job Spark enrichissant les événements Kafka avec les métadonnées tracks/artists.
-
-**Fichier créé :** `spark_jobs/streaming_enrichment_job.py` (3855 bytes)
-
-**Fonctionnement :**
-- Consomme `listening_events` depuis Kafka
-- Jointure LEFT avec `tracks` et `artists` PostgreSQL
-- Enrichit chaque événement avec `track_title`, `artist_name`, `genre`, `label`
-- Dédoublonnage sur `event_id` avant insertion
-
-**Screenshot :**
-
-![issue17 spark_jobs](screenshots/issue16_17_18_terminal.png)
-*`ls -la spark_jobs/` — 3 jobs présents dont `streaming_enrichment_job.py` (3855 bytes, 4 Jun 20:59)*
-
----
-
-## Issue #18 — fraud_detection_job.py
-
-**Objectif** : Détecter les bots via fenêtre glissante — seuil > 10 events/minute par utilisateur.
-
-**Fichier créé :** `spark_jobs/fraud_detection_job.py` (3930 bytes)
-
-**Algorithme :**
-- Fenêtre glissante 1 minute / slide 30 secondes
-- Seuil : `MAX_EVENTS_PER_MINUTE = 10`
-- Suspects envoyés en DLQ (`dead_letter_events`)
-
-**Screenshot :**
-
-![issue18 fraud_detection](screenshots/issue16_17_18_terminal.png)
-*`ls -la spark_jobs/fraud_detection_job.py` — fichier présent (3930 bytes, 4 Jun 21:03)*
-
----
-
-## Issue #19 — reconciliation_pipeline
-
-**Objectif** : DAG comparant `realtime_top_tracks` vs `listening_events` toutes les 30 minutes.
-
-**DAG :** `reconciliation_pipeline`
-**Schedule :** `*/30 * * * *`
-**Description :** Réconciliation données streaming vs batch PostgreSQL
-
-**Tâches du DAG :**
-| Tâche | Rôle |
-|---|---|
-| `count_realtime_events` | Compte les fenêtres dans `realtime_top_tracks` |
-| `count_batch_events` | Compte les events dans `listening_events` |
-| `detect_missing_events` | Tracks présentes en realtime absentes du batch |
-| `compute_reconciliation_score` | Score OK / WARNING / CRITICAL |
-| `store_reconciliation_report` | Stocke le rapport dans `dead_letter_events` |
-
-**Propriétés validées :** `Is active: true` · `Has import errors: false` · `Is paused: false`
-
-**Screenshot :**
-
-![issue19 reconciliation](screenshots/issue19_reconciliation_detail.png)
-*DAG `reconciliation_pipeline` — 5 tâches, schedule `*/30`, is_active=true*
-
----
-
-## Issue #20 — late_events_reprocessing
-
-**Objectif** : DAG retraitant les événements tardifs depuis la DLQ toutes les heures.
-
-**DAG :** `late_events_reprocessing`
-**Schedule :** `@hourly`
-**Description :** Retraitement des événements tardifs depuis la DLQ
-
-**Tâches du DAG :**
-| Tâche | Rôle |
-|---|---|
-| `fetch_late_events` | Récupère events `status='pending'` et `error_type='late_event'` |
-| `reprocess_late_events` | Réinjecte dans `listening_events` via `ON CONFLICT DO NOTHING` |
-| `update_dlq_status` | Met à jour `status='reprocessed'` dans `dead_letter_events` |
-
-**Propriétés validées :** `Is active: true` · `Has import errors: false` · `Is paused: false`
-
-**Screenshot :**
-
-![issue20 late_events](screenshots/issue20_late_events_detail.png)
-*DAG `late_events_reprocessing` — 3 tâches, @hourly, is_active=true*
-
----
-
-## Résumé Phase 2
-
-| Issue | Titre | Critère | Statut |
-|---|---|---|---|
-| #16 | Fix UUID cast | `COUNT(*) FROM realtime_top_tracks` = 602 | ✅ Validé |
-| #17 | streaming_enrichment_job | Fichier présent 3855 bytes | ✅ Validé |
-| #18 | fraud_detection_job | Fichier présent 3930 bytes | ✅ Validé |
-| #19 | reconciliation_pipeline | DAG actif, 5 tâches, schedule */30 | ✅ Validé |
-| #20 | late_events_reprocessing | DAG actif, 3 tâches, @hourly | ✅ Validé |
-
----
-
 ## Issue #6 — DAG streaming_events_pipeline
 
 **Objectif** : Consommer les événements Redis, les valider, les enrichir et les stocker dans PostgreSQL et MinIO.
@@ -358,38 +220,6 @@ cp ~/Downloads/CleanShot\ 2026-06-04\ at\ 23.48.14@2x.png docs/screenshots/issue
 cp ~/Downloads/CleanShot\ 2026-06-04\ at\ 23.52.11@2x.png docs/screenshots/issue6_7_9_14_counts.png
 Puis génère le markdown et push :
 bashcat >> docs/VALIDATION.md << 'EOF'
-
----
-
-## Issue #6 — DAG streaming_events_pipeline
-
-**Objectif** : Consommer les événements Redis, les valider, les enrichir et les stocker dans PostgreSQL et MinIO.
-
-**Fichier créé :** `dags/streaming_events_pipeline.py`
-
-**Tâches du DAG :**
-| Tâche | Rôle |
-|---|---|
-| `consume_from_redis` | Micro-batch 5 min depuis Redis pub/sub |
-| `validate_events` | Champs obligatoires, invalides → DLQ |
-| `enrich_events` | Jointure catalogue PostgreSQL (track_id → artiste, genre) |
-| `store_to_parquet` | Parquet sur MinIO partitionné par heure |
-| `upsert_to_postgres` | Insert dans `listening_events` |
-
-**Commande de validation :**
-```bash
-docker compose exec postgres psql -U airflow -d spotify -c "SELECT COUNT(*) FROM listening_events;"
-```
-
-**Résultat obtenu :**
-listening_events
-         6116
-(1 row)
-
-**Screenshot :**
-
-![issue6 counts](screenshots/issue6_7_9_14_counts.png)
-*`SELECT COUNT(*) FROM listening_events` — 6116 événements stockés*
 
 ---
 
@@ -496,6 +326,28 @@ docker compose exec airflow-worker bash -c "cd /opt/airflow && python -m pytest 
 
 ![issue10 pytest](screenshots/issue6_9_10_14_15_terminal.png)
 *`pytest tests/` — 34 passed, 0 failed*
+
+---
+
+## Résumé Phase 1 (Issues #6 à #10)
+
+| Issue | Titre | Critère | Statut |
+|---|---|---|---|
+| #6 | streaming_events_pipeline | `COUNT(*) FROM listening_events` = 6116 | ✅ Validé |
+| #7 | aggregation_pipeline | `COUNT(*) FROM daily_streams` = 50 | ✅ Validé |
+| #8 | recommendation_pipeline | DAG configuré, 0 import errors | ⚠️ Partiel |
+| #9 | dlq_reprocessing_pipeline | 44123 events pending en DLQ | ✅ Validé |
+| #10 | Tests + README | `pytest tests/` — 34 passed, 0 failed | ✅ Validé |
+
+## Résumé Phase 2 Spark/Kafka (Issues #11 à #15)
+
+| Issue | Titre | Critère | Statut |
+|---|---|---|---|
+| #11 | Cluster Kafka KRaft | 6 topics, 3 brokers, compact config | ✅ Validé |
+| #12 | Simulateur dual publish | 9137 messages dans listening_events | ✅ Validé |
+| #13 | Premier job Spark | spark-master démarré, connexion Kafka | ✅ Validé |
+| #14 | Fenêtres temporelles | 602 fenêtres dans realtime_top_tracks | ✅ Validé |
+| #15 | Watermarking | `.withWatermark` ligne 99 + topic late_events | ✅ Validé |
 
 ---
 
@@ -624,22 +476,126 @@ grep -n "withWatermark" spark_jobs/streaming_trends_job.py
 
 ---
 
-## Résumé Phase 1 (Issues #6 à #10)
+## Issue #16 — Exactly-once / Fix UUID cast
+
+**Objectif** : Spark écrit dans `realtime_top_tracks` sans erreur de type UUID ni duplicate key.
+
+**Fix appliqué dans `spark_jobs/streaming_trends_job.py` :**
+- `stringtype=unspecified` dans `POSTGRES_PROPS`
+- `mode="overwrite"` dans `write_to_postgres()`
+
+**Commande exécutée :**
+```bash
+docker compose exec postgres psql -U airflow -d spotify -c \
+  "SELECT COUNT(*), MIN(window_start), MAX(window_end) FROM realtime_top_tracks;"
+```
+
+**Résultat obtenu :**
+count |          min           |          max
+-------+------------------------+------------------------
+602 | 2026-06-04 18:50:00+00 | 2026-06-04 19:10:00+00
+(1 row)
+
+**Screenshot :**
+
+![issue16 terminal](screenshots/issue16_17_18_terminal.png)
+*`SELECT COUNT(*) FROM realtime_top_tracks` — 602 fenêtres écrites sans erreur UUID*
+
+---
+
+## Issue #17 — streaming_enrichment_job.py
+
+**Objectif** : Job Spark enrichissant les événements Kafka avec les métadonnées tracks/artists.
+
+**Fichier créé :** `spark_jobs/streaming_enrichment_job.py` (3855 bytes)
+
+**Fonctionnement :**
+- Consomme `listening_events` depuis Kafka
+- Jointure LEFT avec `tracks` et `artists` PostgreSQL
+- Enrichit chaque événement avec `track_title`, `artist_name`, `genre`, `label`
+- Dédoublonnage sur `event_id` avant insertion
+
+**Screenshot :**
+
+![issue17 spark_jobs](screenshots/issue16_17_18_terminal.png)
+*`ls -la spark_jobs/` — 3 jobs présents dont `streaming_enrichment_job.py` (3855 bytes, 4 Jun 20:59)*
+
+---
+
+## Issue #18 — fraud_detection_job.py
+
+**Objectif** : Détecter les bots via fenêtre glissante — seuil > 10 events/minute par utilisateur.
+
+**Fichier créé :** `spark_jobs/fraud_detection_job.py` (3930 bytes)
+
+**Algorithme :**
+- Fenêtre glissante 1 minute / slide 30 secondes
+- Seuil : `MAX_EVENTS_PER_MINUTE = 10`
+- Suspects envoyés en DLQ (`dead_letter_events`)
+
+**Screenshot :**
+
+![issue18 fraud_detection](screenshots/issue16_17_18_terminal.png)
+*`ls -la spark_jobs/fraud_detection_job.py` — fichier présent (3930 bytes, 4 Jun 21:03)*
+
+---
+
+## Issue #19 — reconciliation_pipeline
+
+**Objectif** : DAG comparant `realtime_top_tracks` vs `listening_events` toutes les 30 minutes.
+
+**DAG :** `reconciliation_pipeline`
+**Schedule :** `*/30 * * * *`
+**Description :** Réconciliation données streaming vs batch PostgreSQL
+
+**Tâches du DAG :**
+| Tâche | Rôle |
+|---|---|
+| `count_realtime_events` | Compte les fenêtres dans `realtime_top_tracks` |
+| `count_batch_events` | Compte les events dans `listening_events` |
+| `detect_missing_events` | Tracks présentes en realtime absentes du batch |
+| `compute_reconciliation_score` | Score OK / WARNING / CRITICAL |
+| `store_reconciliation_report` | Stocke le rapport dans `dead_letter_events` |
+
+**Propriétés validées :** `Is active: true` · `Has import errors: false` · `Is paused: false`
+
+**Screenshot :**
+
+![issue19 reconciliation](screenshots/issue19_reconciliation_detail.png)
+*DAG `reconciliation_pipeline` — 5 tâches, schedule `*/30`, is_active=true*
+
+---
+
+## Issue #20 — late_events_reprocessing
+
+**Objectif** : DAG retraitant les événements tardifs depuis la DLQ toutes les heures.
+
+**DAG :** `late_events_reprocessing`
+**Schedule :** `@hourly`
+**Description :** Retraitement des événements tardifs depuis la DLQ
+
+**Tâches du DAG :**
+| Tâche | Rôle |
+|---|---|
+| `fetch_late_events` | Récupère events `status='pending'` et `error_type='late_event'` |
+| `reprocess_late_events` | Réinjecte dans `listening_events` via `ON CONFLICT DO NOTHING` |
+| `update_dlq_status` | Met à jour `status='reprocessed'` dans `dead_letter_events` |
+
+**Propriétés validées :** `Is active: true` · `Has import errors: false` · `Is paused: false`
+
+**Screenshot :**
+
+![issue20 late_events](screenshots/issue20_late_events_detail.png)
+*DAG `late_events_reprocessing` — 3 tâches, @hourly, is_active=true*
+
+---
+
+## Résumé Phase 2
 
 | Issue | Titre | Critère | Statut |
 |---|---|---|---|
-| #6 | streaming_events_pipeline | `COUNT(*) FROM listening_events` = 6116 | ✅ Validé |
-| #7 | aggregation_pipeline | `COUNT(*) FROM daily_streams` = 50 | ✅ Validé |
-| #8 | recommendation_pipeline | DAG configuré, 0 import errors | ⚠️ Partiel |
-| #9 | dlq_reprocessing_pipeline | 44123 events pending en DLQ | ✅ Validé |
-| #10 | Tests + README | `pytest tests/` — 34 passed, 0 failed | ✅ Validé |
-
-## Résumé Phase 2 Spark/Kafka (Issues #11 à #15)
-
-| Issue | Titre | Critère | Statut |
-|---|---|---|---|
-| #11 | Cluster Kafka KRaft | 6 topics, 3 brokers, compact config | ✅ Validé |
-| #12 | Simulateur dual publish | 9137 messages dans listening_events | ✅ Validé |
-| #13 | Premier job Spark | spark-master démarré, connexion Kafka | ✅ Validé |
-| #14 | Fenêtres temporelles | 602 fenêtres dans realtime_top_tracks | ✅ Validé |
-| #15 | Watermarking | `.withWatermark` ligne 99 + topic late_events | ✅ Validé |
+| #16 | Fix UUID cast | `COUNT(*) FROM realtime_top_tracks` = 602 | ✅ Validé |
+| #17 | streaming_enrichment_job | Fichier présent 3855 bytes | ✅ Validé |
+| #18 | fraud_detection_job | Fichier présent 3930 bytes | ✅ Validé |
+| #19 | reconciliation_pipeline | DAG actif, 5 tâches, schedule */30 | ✅ Validé |
+| #20 | late_events_reprocessing | DAG actif, 3 tâches, @hourly | ✅ Validé |
