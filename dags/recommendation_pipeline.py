@@ -2,18 +2,23 @@
 DAG : recommendation_pipeline
 =============================
 
-Genere des recommandations musicales personnalisees a partir des ecoutes
-utilisateurs et les stocke dans Redis + PostgreSQL.
+Génère des recommandations musicales personnalisées à partir des écoutes,
+du catalogue et des agrégats journaliers.
 
-Destination PostgreSQL :
-    recommendations(user_id, track_id, score, generated_at)
+Stratégie :
+    1. Identifier les genres et artistes écoutés par chaque utilisateur.
+    2. Proposer des tracks du même genre ou du même artiste.
+    3. Exclure les tracks déjà écoutées.
+    4. Favoriser les tracks populaires dans daily_streams.
+    5. Insérer les recommandations dans PostgreSQL et les stocker dans Redis.
 """
+
+from __future__ import annotations
 
 import json
 import logging
-import math
-from collections import defaultdict
 from datetime import datetime, timedelta
+from typing import Any
 
 import redis
 from airflow import DAG
@@ -24,6 +29,13 @@ from airflow.sensors.external_task import ExternalTaskSensor
 
 logger = logging.getLogger(__name__)
 
+POSTGRES_CONN_ID = "spotify_postgres"
+REDIS_URL = "redis://redis:6379/1"
+
+RECO_TTL_SECONDS = 86400
+TOP_N_RECO = 10
+
+
 DEFAULT_ARGS = {
     "owner": "spotify-team",
     "depends_on_past": False,
@@ -33,54 +45,27 @@ DEFAULT_ARGS = {
     "execution_timeout": timedelta(minutes=45),
 }
 
-POSTGRES_CONN_ID = "spotify_postgres"
-REDIS_URL = "redis://redis:6379/1"
-
-RECO_TTL_SECONDS = 86400
-TOP_N_RECO = 10
-LOOKBACK_DAYS = 7
-
 
 DAG_DOC = """
 ## recommendation_pipeline
 
-Ce DAG genere des recommandations musicales personnalisees.
+Ce DAG génère des recommandations musicales personnalisées.
 
 ### Logique
-1. Lire les ecoutes recentes dans `listening_events`
-2. Construire une matrice user -> track -> nombre d'ecoutes
-3. Calculer une similarite simple entre utilisateurs
-4. Recommander des morceaux ecoutes par des utilisateurs proches
-5. Eviter de recommander un morceau deja ecoute
-6. Inserer les recommandations dans PostgreSQL avec un upsert idempotent
-7. Stocker aussi les recommandations dans Redis avec une TTL de 24h
+
+- lire les préférences utilisateur depuis `listening_events` et `tracks` ;
+- identifier les genres/artistes préférés ;
+- proposer des tracks du catalogue non encore écoutées ;
+- pondérer avec la popularité issue de `daily_streams` ;
+- insérer dans `recommendations` avec un upsert idempotent ;
+- stocker aussi les recommandations dans Redis avec une TTL de 24h.
 """
-
-
-def cosine_similarity(user_a: dict, user_b: dict) -> float:
-    """
-    Calcule une similarite cosinus simple entre deux profils utilisateurs.
-    Chaque profil est un dict {track_id: play_count}.
-    """
-    common_tracks = set(user_a.keys()) & set(user_b.keys())
-
-    if not common_tracks:
-        return 0.0
-
-    dot_product = sum(user_a[track] * user_b[track] for track in common_tracks)
-    norm_a = math.sqrt(sum(count * count for count in user_a.values()))
-    norm_b = math.sqrt(sum(count * count for count in user_b.values()))
-
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-
-    return dot_product / (norm_a * norm_b)
 
 
 with DAG(
     dag_id="recommendation_pipeline",
     default_args=DEFAULT_ARGS,
-    description="Generate music recommendations from listening events",
+    description="Generate music recommendations from listening events and daily aggregates",
     schedule_interval="0 5 * * *",
     catchup=False,
     max_active_runs=1,
@@ -98,118 +83,123 @@ with DAG(
         mode="reschedule",
     )
 
-    @task(task_id="build_user_track_matrix")
-    def build_user_track_matrix() -> dict:
+    @task(task_id="generate_recommendations")
+    def generate_recommendations() -> list[dict[str, Any]]:
         """
-        Construit la matrice user -> track -> play_count a partir des ecoutes.
+        Génère des recommandations robustes, même avec peu d'événements.
+
+        La requête :
+        - construit les préférences par genre ;
+        - construit les préférences par artiste ;
+        - exclut les morceaux déjà écoutés ;
+        - score les candidats avec genre + artiste + popularité.
         """
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
-        query = f"""
-            SELECT
-                user_id,
-                track_id,
-                COUNT(*) AS play_count
-            FROM listening_events
-            WHERE "timestamp" >= NOW() - INTERVAL '{LOOKBACK_DAYS} days'
-              AND completed = TRUE
-            GROUP BY user_id, track_id
-        """
-
-        rows = hook.get_records(query)
-
-        matrix = defaultdict(dict)
-
-        for user_id, track_id, play_count in rows:
-            matrix[str(user_id)][str(track_id)] = int(play_count)
-
-        filtered_matrix = {
-            user_id: tracks
-            for user_id, tracks in matrix.items()
-            if len(tracks) >= 3
-        }
-
-        logger.info(
-            "User-track matrix built: users=%s, filtered_users=%s, rows=%s",
-            len(matrix),
-            len(filtered_matrix),
-            len(rows),
-        )
-
-        return {
-            "matrix": filtered_matrix,
-            "users": list(filtered_matrix.keys()),
-        }
-
-    @task(task_id="compute_recommendations")
-    def compute_recommendations(matrix_data: dict) -> dict:
-        """
-        Calcule les recommandations par similarite entre utilisateurs.
-        """
-        matrix = matrix_data.get("matrix", {})
-        users = matrix_data.get("users", [])
-
-        recommendations = {}
-
-        if not users:
-            logger.warning("No active users found for recommendations")
-            return recommendations
-
-        for user_id in users:
-            user_profile = matrix[user_id]
-            listened_tracks = set(user_profile.keys())
-
-            neighbor_scores = []
-
-            for other_user_id in users:
-                if other_user_id == user_id:
-                    continue
-
-                similarity = cosine_similarity(user_profile, matrix[other_user_id])
-
-                if similarity > 0:
-                    neighbor_scores.append((other_user_id, similarity))
-
-            neighbor_scores.sort(key=lambda item: item[1], reverse=True)
-            top_neighbors = neighbor_scores[:TOP_N_RECO]
-
-            candidate_scores = defaultdict(float)
-
-            for neighbor_id, similarity in top_neighbors:
-                neighbor_profile = matrix[neighbor_id]
-
-                for track_id, play_count in neighbor_profile.items():
-                    if track_id not in listened_tracks:
-                        candidate_scores[track_id] += similarity * play_count
-
-            ranked_tracks = sorted(
-                candidate_scores.items(),
-                key=lambda item: item[1],
-                reverse=True,
+        query = """
+            WITH active_users AS (
+                SELECT DISTINCT user_id
+                FROM listening_events
+                WHERE completed = TRUE
+            ),
+            listened_tracks AS (
+                SELECT DISTINCT user_id, track_id
+                FROM listening_events
+                WHERE completed = TRUE
+            ),
+            user_genres AS (
+                SELECT
+                    le.user_id,
+                    t.genre,
+                    COUNT(*)::float AS genre_count
+                FROM listening_events le
+                JOIN tracks t ON t.id = le.track_id
+                WHERE le.completed = TRUE
+                  AND t.genre IS NOT NULL
+                GROUP BY le.user_id, t.genre
+            ),
+            user_artists AS (
+                SELECT
+                    le.user_id,
+                    t.artist_id,
+                    COUNT(*)::float AS artist_count
+                FROM listening_events le
+                JOIN tracks t ON t.id = le.track_id
+                WHERE le.completed = TRUE
+                GROUP BY le.user_id, t.artist_id
+            ),
+            track_popularity AS (
+                SELECT
+                    track_id,
+                    SUM(total_streams)::float AS popularity
+                FROM daily_streams
+                GROUP BY track_id
+            ),
+            candidates AS (
+                SELECT
+                    au.user_id,
+                    tr.id AS track_id,
+                    (
+                        0.50 * COALESCE(ug.genre_count, 0)
+                        + 0.30 * COALESCE(ua.artist_count, 0)
+                        + 0.20 * LEAST(COALESCE(tp.popularity, 0), 100)
+                        + 0.01 * random()
+                    ) AS score
+                FROM active_users au
+                JOIN tracks tr ON TRUE
+                LEFT JOIN user_genres ug
+                    ON ug.user_id = au.user_id
+                   AND ug.genre = tr.genre
+                LEFT JOIN user_artists ua
+                    ON ua.user_id = au.user_id
+                   AND ua.artist_id = tr.artist_id
+                LEFT JOIN track_popularity tp
+                    ON tp.track_id = tr.id
+                LEFT JOIN listened_tracks lt
+                    ON lt.user_id = au.user_id
+                   AND lt.track_id = tr.id
+                WHERE lt.track_id IS NULL
+                  AND (
+                        ug.genre_count IS NOT NULL
+                     OR ua.artist_count IS NOT NULL
+                     OR tp.popularity IS NOT NULL
+                  )
+            ),
+            ranked AS (
+                SELECT
+                    user_id::text,
+                    track_id::text,
+                    ROUND(score::numeric, 6)::float AS score,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY user_id
+                        ORDER BY score DESC, track_id
+                    ) AS rank
+                FROM candidates
             )
+            SELECT user_id, track_id, score
+            FROM ranked
+            WHERE rank <= %s
+            ORDER BY user_id, score DESC
+        """
 
-            recommendations[user_id] = [
-                {
-                    "track_id": track_id,
-                    "score": round(float(score), 6),
-                }
-                for track_id, score in ranked_tracks[:TOP_N_RECO]
-            ]
+        rows = hook.get_records(query, parameters=(TOP_N_RECO,))
 
-        total_recommendations = sum(len(items) for items in recommendations.values())
+        recommendations = [
+            {
+                "user_id": row[0],
+                "track_id": row[1],
+                "score": float(row[2]),
+            }
+            for row in rows
+        ]
 
-        logger.info(
-            "Recommendations computed: users=%s, total_recommendations=%s",
-            len(recommendations),
-            total_recommendations,
-        )
-
+        logger.info("Recommendations generated: total=%s", len(recommendations))
         return recommendations
 
     @task(task_id="store_recommendations")
-    def store_recommendations(recommendations: dict) -> dict:
+    def store_recommendations(recommendations: list[dict[str, Any]]) -> dict[str, int]:
         """
-        Stocke les recommandations dans Redis et PostgreSQL.
+        Stocke les recommandations dans PostgreSQL et Redis.
         """
         if not recommendations:
             logger.warning("No recommendations to store")
@@ -230,37 +220,38 @@ with DAG(
                 generated_at = NOW()
         """
 
-        total_recommendations = 0
+        by_user: dict[str, list[dict[str, Any]]] = {}
+
+        for reco in recommendations:
+            by_user.setdefault(reco["user_id"], []).append(
+                {
+                    "track_id": reco["track_id"],
+                    "score": reco["score"],
+                }
+            )
 
         conn = hook.get_conn()
 
         try:
             with conn.cursor() as cursor:
-                for user_id, recos in recommendations.items():
-                    if not recos:
-                        continue
-
-                    redis_key = f"reco:{user_id}"
-                    redis_payload = json.dumps(recos)
-
-                    redis_client.setex(
-                        redis_key,
-                        RECO_TTL_SECONDS,
-                        redis_payload,
+                for reco in recommendations:
+                    cursor.execute(
+                        insert_query,
+                        (
+                            reco["user_id"],
+                            reco["track_id"],
+                            reco["score"],
+                        ),
                     )
 
-                    for reco in recos:
-                        cursor.execute(
-                            insert_query,
-                            (
-                                user_id,
-                                reco["track_id"],
-                                reco["score"],
-                            ),
-                        )
-                        total_recommendations += 1
+                conn.commit()
 
-            conn.commit()
+            for user_id, recos in by_user.items():
+                redis_client.setex(
+                    f"reco:{user_id}",
+                    RECO_TTL_SECONDS,
+                    json.dumps(recos, ensure_ascii=False),
+                )
 
         except Exception:
             conn.rollback()
@@ -270,25 +261,17 @@ with DAG(
         finally:
             conn.close()
 
-        users_with_recos = sum(
-            1
-            for recos in recommendations.values()
-            if len(recos) > 0
-        )
-
         logger.info(
-            "Recommendations stored: users_with_recos=%s, total=%s",
-            users_with_recos,
-            total_recommendations,
+            "Recommendations stored: users=%s, total=%s",
+            len(by_user),
+            len(recommendations),
         )
 
         return {
-            "users_with_recos": users_with_recos,
-            "total_recommendations": total_recommendations,
+            "users_with_recos": len(by_user),
+            "total_recommendations": len(recommendations),
         }
 
-    matrix = build_user_track_matrix()
-    recommendations = compute_recommendations(matrix)
-
-    wait_for_aggregation >> matrix
-    store_recommendations(recommendations)
+    recos = generate_recommendations()
+    wait_for_aggregation >> recos
+    store_recommendations(recos)
