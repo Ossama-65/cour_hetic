@@ -329,28 +329,6 @@ docker compose exec airflow-worker bash -c "cd /opt/airflow && python -m pytest 
 
 ---
 
-## Résumé Phase 1 (Issues #6 à #10)
-
-| Issue | Titre | Critère | Statut |
-|---|---|---|---|
-| #6 | streaming_events_pipeline | `COUNT(*) FROM listening_events` = 6116 | ✅ Validé |
-| #7 | aggregation_pipeline | `COUNT(*) FROM daily_streams` = 50 | ✅ Validé |
-| #8 | recommendation_pipeline | DAG configuré, 0 import errors | ⚠️ Partiel |
-| #9 | dlq_reprocessing_pipeline | 44123 events pending en DLQ | ✅ Validé |
-| #10 | Tests + README | `pytest tests/` — 34 passed, 0 failed | ✅ Validé |
-
-## Résumé Phase 2 Spark/Kafka (Issues #11 à #15)
-
-| Issue | Titre | Critère | Statut |
-|---|---|---|---|
-| #11 | Cluster Kafka KRaft | 6 topics, 3 brokers, compact config | ✅ Validé |
-| #12 | Simulateur dual publish | 9137 messages dans listening_events | ✅ Validé |
-| #13 | Premier job Spark | spark-master démarré, connexion Kafka | ✅ Validé |
-| #14 | Fenêtres temporelles | 602 fenêtres dans realtime_top_tracks | ✅ Validé |
-| #15 | Watermarking | `.withWatermark` ligne 99 + topic late_events | ✅ Validé |
-
----
-
 ## Issue #11 — Cluster Kafka KRaft 3 brokers
 
 **Objectif** : Cluster Kafka 3 brokers en mode KRaft, UI accessible sur http://localhost:8090.
@@ -587,6 +565,28 @@ count |          min           |          max
 
 ![issue20 late_events](screenshots/issue20_late_events_detail.png)
 *DAG `late_events_reprocessing` — 3 tâches, @hourly, is_active=true*
+
+---
+
+## Résumé Phase 1 (Issues #6 à #10)
+
+| Issue | Titre | Critère | Statut |
+|---|---|---|---|
+| #6 | streaming_events_pipeline | `COUNT(*) FROM listening_events` = 6116 | ✅ Validé |
+| #7 | aggregation_pipeline | `COUNT(*) FROM daily_streams` = 50 | ✅ Validé |
+| #8 | recommendation_pipeline | DAG configuré, 0 import errors | ⚠️ Partiel |
+| #9 | dlq_reprocessing_pipeline | 44123 events pending en DLQ | ✅ Validé |
+| #10 | Tests + README | `pytest tests/` — 34 passed, 0 failed | ✅ Validé |
+
+## Résumé Phase 2 Spark/Kafka (Issues #11 à #15)
+
+| Issue | Titre | Critère | Statut |
+|---|---|---|---|
+| #11 | Cluster Kafka KRaft | 6 topics, 3 brokers, compact config | ✅ Validé |
+| #12 | Simulateur dual publish | 9137 messages dans listening_events | ✅ Validé |
+| #13 | Premier job Spark | spark-master démarré, connexion Kafka | ✅ Validé |
+| #14 | Fenêtres temporelles | 602 fenêtres dans realtime_top_tracks | ✅ Validé |
+| #15 | Watermarking | `.withWatermark` ligne 99 + topic late_events | ✅ Validé |
 
 ---
 
