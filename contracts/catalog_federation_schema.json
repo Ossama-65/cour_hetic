@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FederatedTrack",
+  "description": "Format commun d'un track federe entre groupes",
+  "type": "object",
+  "required": ["track_id", "title", "artist_id", "duration_ms", "source_group"],
+  "properties": {
+    "track_id":     { "type": "string", "format": "uuid" },
+    "title":        { "type": "string", "minLength": 1 },
+    "artist_id":    { "type": "string", "format": "uuid" },
+    "artist_name":  { "type": "string" },
+    "album_id":     { "type": ["string", "null"] },
+    "duration_ms":  { "type": "integer", "minimum": 1000, "maximum": 3600000 },
+    "genre":        { "type": ["string", "null"] },
+    "label":        { "type": ["string", "null"] },
+    "source_group": { "type": "string", "description": "Identifiant du groupe emetteur ex: groupe-d" },
+    "schema_version": { "type": "string", "default": "1.0" },
+    "emitted_at":   { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

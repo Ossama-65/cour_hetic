@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "P2PCrossGroupRequest",
+  "description": "Format d'une requete P2P entre groupes",
+  "type": "object",
+  "required": ["request_id", "from_group", "to_group", "track_id", "user_id", "timestamp"],
+  "properties": {
+    "request_id":  { "type": "string", "format": "uuid" },
+    "from_group":  { "type": "string" },
+    "to_group":    { "type": "string" },
+    "track_id":    { "type": "string", "format": "uuid" },
+    "user_id":     { "type": "string", "format": "uuid" },
+    "timestamp":   { "type": "string", "format": "date-time" },
+    "ttl_seconds": { "type": "integer", "default": 30 },
+    "schema_version": { "type": "string", "default": "1.0" }
+  },
+  "additionalProperties": false
+}

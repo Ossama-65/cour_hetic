@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GlobalMetrics",
+  "description": "Format des metriques partagees entre groupes pour le Top 50 Global",
+  "type": "object",
+  "required": ["group_id", "window_start", "window_end", "top_tracks", "emitted_at"],
+  "properties": {
+    "group_id":     { "type": "string" },
+    "window_start": { "type": "string", "format": "date-time" },
+    "window_end":   { "type": "string", "format": "date-time" },
+    "top_tracks": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "required": ["track_id", "stream_count"],
+        "properties": {
+          "track_id":        { "type": "string", "format": "uuid" },
+          "stream_count":    { "type": "integer", "minimum": 0 },
+          "unique_listeners":{ "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "emitted_at":     { "type": "string", "format": "date-time" },
+    "schema_version": { "type": "string", "default": "1.0" }
+  },
+  "additionalProperties": false
+}
