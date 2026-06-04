@@ -1,6 +1,6 @@
 networks:
   default:
-    name: spotify_default
+    name: cours_hetic_default
     external: true
 
 services:
@@ -85,9 +85,10 @@ services:
       "
 
   spark-master:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.0
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     environment:
-      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
       SPARK_MASTER_PORT: 7077
       SPARK_MASTER_WEBUI_PORT: 8888
     ports:
@@ -97,10 +98,9 @@ services:
       - ./spark_jobs:/opt/spark-jobs
 
   spark-worker-1:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.0
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
     depends_on:
@@ -109,10 +109,9 @@ services:
       - ./spark_jobs:/opt/spark-jobs
 
   spark-worker-2:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.0
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
     depends_on:
