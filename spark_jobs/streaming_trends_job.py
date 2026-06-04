@@ -38,6 +38,7 @@ POSTGRES_PROPS   = {
     "user":     "airflow",
     "password": "airflow",
     "driver":   "org.postgresql.Driver",
+    "stringtype": "unspecified",
 }
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -131,8 +132,8 @@ def compute_top_tracks_tumbling(events_df):
             batch_df.write.jdbc(
                 url=POSTGRES_URL,
                 table="realtime_top_tracks",
-                mode="append",
-                properties=POSTGRES_PROPS
+                mode="overwrite",
+                properties={**POSTGRES_PROPS, "stringtype": "unspecified"},
             )
             print(f"[batch {batch_id}] top_tracks: {batch_df.count()} lignes ecrites dans PostgreSQL")
         except Exception as e:
