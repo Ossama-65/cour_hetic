@@ -6,33 +6,33 @@
 
 ```mermaid
 graph TD
-    GEN[Data Generator<br/>Faker — 3 labels] -->|JSON files| MINIO_RAW[(MinIO<br/>labels-raw/)]
-    SIM[Simulateur P2P<br/>Python] -->|pub/sub + buffer| REDIS[(Redis DB1<br/>listening_events)]
-    SIM -->|produce dual| KAFKA[Apache Kafka<br/>listening_events<br/>p2p_network_events]
+    GEN[Data Generator Faker] -->|JSON files| MINIO_RAW[(MinIO labels-raw)]
+    SIM[Simulateur P2P] -->|pub/sub + buffer| REDIS[(Redis DB1)]
+    SIM -->|produce| KAFKA[Apache Kafka]
 
-    MINIO_RAW -->|extract| DAG1[catalog_ingestion_pipeline<br/>0 2 * * *]
-    REDIS -->|consume buffer| DAG2[streaming_events_pipeline<br/>*/5 * * * *]
+    MINIO_RAW -->|extract| DAG1[catalog_ingestion_pipeline]
+    REDIS -->|consume buffer| DAG2[streaming_events_pipeline]
 
-    DAG1 -->|upsert| PG[(PostgreSQL<br/>artists / albums / tracks)]
-    DAG1 -->|schema invalide| DLQ[(dead_letter_events)]
+    DAG1 -->|upsert| PG[(PostgreSQL)]
+    DAG1 -->|invalide| DLQ[(dead_letter_events)]
 
-    DAG2 -->|upsert ON CONFLICT| PG
-    DAG2 -->|partitionné date/heure| MINIO_PQ[(MinIO<br/>spotify-parquet/)]
-    DAG2 -->|invalide / track inconnue| DLQ
+    DAG2 -->|upsert| PG
+    DAG2 -->|parquet| MINIO_PQ[(MinIO spotify-parquet)]
+    DAG2 -->|invalide| DLQ
 
-    PG -->|ExternalTaskSensor| DAG3[aggregation_pipeline<br/>0 4 * * *]
+    PG -->|ExternalTaskSensor| DAG3[aggregation_pipeline]
     DAG3 -->|upsert| PG
 
-    PG -->|ExternalTaskSensor| DAG4[recommendation_pipeline<br/>0 5 * * *]
-    DAG4 -->|reco:user_id TTL 24h| REDIS
+    PG -->|ExternalTaskSensor| DAG4[recommendation_pipeline]
+    DAG4 -->|reco TTL 24h| REDIS
     DAG4 -->|upsert| PG
 
-    DLQ -->|fetch pending| DAG5[dlq_reprocessing_pipeline<br/>@hourly]
-    DAG5 -->|réinjection| PG
+    DLQ -->|fetch pending| DAG5[dlq_reprocessing_pipeline]
+    DAG5 -->|reinjection| PG
 
-    KAFKA -->|Spark Structured Streaming| SPARK[Spark Jobs<br/>Phase 2]
+    KAFKA -->|Spark Streaming| SPARK[Spark Jobs Phase 2]
     SPARK -->|write| PG
-    SPARK -->|checkpoint| MINIO_CK[(MinIO<br/>spotify-checkpoints/)]
+    SPARK -->|checkpoint| MINIO_CK[(MinIO checkpoints)]
     SPARK -->|cache| REDIS
 ```
 
