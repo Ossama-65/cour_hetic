@@ -381,3 +381,53 @@ git push origin groupe-d/main
 | Tracks PostgreSQL              | 1437                | OK     |
 | Dead letter events             | 382 pending         | OK     |
 | Recommandations Redis (base 1) | 448 / 45 users      | OK     |
+
+---
+
+## Phase 2 — Incidents & Résolutions
+
+### Incident P2-001 : DNS Kafka non résolu depuis Mac
+**Symptôme** : `Failed to resolve 'kafka-1:9092'` dans le simulateur
+**Cause** : Kafka annonce ses hostnames internes Docker mais le Mac ne les résout pas
+**Fix** : `echo "127.0.0.1 kafka-1 kafka-2 kafka-3" >> /etc/hosts`
+**Statut** : Résolu ✅
+
+### Incident P2-002 : Duplicate key sur realtime_top_tracks
+**Symptôme** : `ERROR: duplicate key value violates unique constraint`
+**Cause** : Spark mode `append` rejoue les mêmes fenêtres à chaque micro-batch
+**Fix** : Passage en `mode="overwrite"` dans write_to_postgres()
+**Statut** : Résolu ✅
+
+### Incident P2-003 : Checkpoints Spark corrompus
+**Symptôme** : `FileNotFoundException: 1.delta does not exist`
+**Cause** : Redémarrage Spark sans nettoyage checkpoint
+**Fix** : `docker exec spark-master rm -rf /tmp/spark-checkpoints`
+**Statut** : Résolu ✅
+
+### Incident P2-004 : psycopg2 absent dans conteneur Spark
+**Symptôme** : `ModuleNotFoundError: No module named 'psycopg2'`
+**Cause** : Image apache/spark:3.5.0 ne contient pas psycopg2
+**Fix** : Utiliser JDBC natif Spark plutôt que psycopg2
+**Statut** : Résolu ✅
+
+---
+
+## Chaos Engineering — Résultats
+
+### Scénario 1 : kafka-2 DOWN
+- **Action** : `docker compose stop kafka-2`
+- **Résultat** : Cluster KRaft reste opérationnel avec kafka-1 + kafka-3
+- **Production** : Continue sans interruption (réplication factor=1)
+- **Status** : ✅ PASS
+
+### Scénario 2 : spark-master KILL
+- **Action** : `docker compose kill spark-master` puis restart
+- **Résultat** : Job Spark redémarre depuis le checkpoint
+- **Données** : Aucune perte (exactly-once via checkpoint)
+- **Status** : ✅ PASS
+
+### Scénario 3 : postgres DOWN 2 minutes
+- **Action** : `docker compose stop postgres` → 2 min → restart
+- **Résultat** : Airflow retry automatique, Spark catch exception et continue
+- **Données** : Aucune perte (events bufferisés dans Kafka)
+- **Status** : ✅ PASS
