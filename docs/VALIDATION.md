@@ -206,3 +206,129 @@ avec les 10 champs requis : `event_id`, `user_id`, `track_id`, `source_peer`, `t
 | #3 | Data Generator Faker | `pytest TestDataGenerator` 4 passed | Validé |
 | #4 | DAG catalog_ingestion | DAGRun vert + `pytest tests/unit/` 18 passed | Validé |
 | #5 | Simulateur P2P | `redis-cli subscribe` events JSON en continu | Validé |
+
+---
+
+## Issue #16 — Exactly-once / Fix UUID cast
+
+**Objectif** : Spark écrit dans `realtime_top_tracks` sans erreur de type UUID ni duplicate key.
+
+**Fix appliqué dans `spark_jobs/streaming_trends_job.py` :**
+- `stringtype=unspecified` dans `POSTGRES_PROPS`
+- `mode="overwrite"` dans `write_to_postgres()`
+
+**Commande exécutée :**
+```bash
+docker compose exec postgres psql -U airflow -d spotify -c \
+  "SELECT COUNT(*), MIN(window_start), MAX(window_end) FROM realtime_top_tracks;"
+```
+
+**Résultat obtenu :**
+count |          min           |          max
+-------+------------------------+------------------------
+602 | 2026-06-04 18:50:00+00 | 2026-06-04 19:10:00+00
+(1 row)
+
+**Screenshot :**
+
+![issue16 terminal](screenshots/issue16_17_18_terminal.png)
+*`SELECT COUNT(*) FROM realtime_top_tracks` — 602 fenêtres écrites sans erreur UUID*
+
+---
+
+## Issue #17 — streaming_enrichment_job.py
+
+**Objectif** : Job Spark enrichissant les événements Kafka avec les métadonnées tracks/artists.
+
+**Fichier créé :** `spark_jobs/streaming_enrichment_job.py` (3855 bytes)
+
+**Fonctionnement :**
+- Consomme `listening_events` depuis Kafka
+- Jointure LEFT avec `tracks` et `artists` PostgreSQL
+- Enrichit chaque événement avec `track_title`, `artist_name`, `genre`, `label`
+- Dédoublonnage sur `event_id` avant insertion
+
+**Screenshot :**
+
+![issue17 spark_jobs](screenshots/issue16_17_18_terminal.png)
+*`ls -la spark_jobs/` — 3 jobs présents dont `streaming_enrichment_job.py` (3855 bytes, 4 Jun 20:59)*
+
+---
+
+## Issue #18 — fraud_detection_job.py
+
+**Objectif** : Détecter les bots via fenêtre glissante — seuil > 10 events/minute par utilisateur.
+
+**Fichier créé :** `spark_jobs/fraud_detection_job.py` (3930 bytes)
+
+**Algorithme :**
+- Fenêtre glissante 1 minute / slide 30 secondes
+- Seuil : `MAX_EVENTS_PER_MINUTE = 10`
+- Suspects envoyés en DLQ (`dead_letter_events`)
+
+**Screenshot :**
+
+![issue18 fraud_detection](screenshots/issue16_17_18_terminal.png)
+*`ls -la spark_jobs/fraud_detection_job.py` — fichier présent (3930 bytes, 4 Jun 21:03)*
+
+---
+
+## Issue #19 — reconciliation_pipeline
+
+**Objectif** : DAG comparant `realtime_top_tracks` vs `listening_events` toutes les 30 minutes.
+
+**DAG :** `reconciliation_pipeline`
+**Schedule :** `*/30 * * * *`
+**Description :** Réconciliation données streaming vs batch PostgreSQL
+
+**Tâches du DAG :**
+| Tâche | Rôle |
+|---|---|
+| `count_realtime_events` | Compte les fenêtres dans `realtime_top_tracks` |
+| `count_batch_events` | Compte les events dans `listening_events` |
+| `detect_missing_events` | Tracks présentes en realtime absentes du batch |
+| `compute_reconciliation_score` | Score OK / WARNING / CRITICAL |
+| `store_reconciliation_report` | Stocke le rapport dans `dead_letter_events` |
+
+**Propriétés validées :** `Is active: true` · `Has import errors: false` · `Is paused: false`
+
+**Screenshot :**
+
+![issue19 reconciliation](screenshots/issue19_reconciliation_detail.png)
+*DAG `reconciliation_pipeline` — 5 tâches, schedule `*/30`, is_active=true*
+
+---
+
+## Issue #20 — late_events_reprocessing
+
+**Objectif** : DAG retraitant les événements tardifs depuis la DLQ toutes les heures.
+
+**DAG :** `late_events_reprocessing`
+**Schedule :** `@hourly`
+**Description :** Retraitement des événements tardifs depuis la DLQ
+
+**Tâches du DAG :**
+| Tâche | Rôle |
+|---|---|
+| `fetch_late_events` | Récupère events `status='pending'` et `error_type='late_event'` |
+| `reprocess_late_events` | Réinjecte dans `listening_events` via `ON CONFLICT DO NOTHING` |
+| `update_dlq_status` | Met à jour `status='reprocessed'` dans `dead_letter_events` |
+
+**Propriétés validées :** `Is active: true` · `Has import errors: false` · `Is paused: false`
+
+**Screenshot :**
+
+![issue20 late_events](screenshots/issue20_late_events_detail.png)
+*DAG `late_events_reprocessing` — 3 tâches, @hourly, is_active=true*
+
+---
+
+## Résumé Phase 2
+
+| Issue | Titre | Critère | Statut |
+|---|---|---|---|
+| #16 | Fix UUID cast | `COUNT(*) FROM realtime_top_tracks` = 602 | ✅ Validé |
+| #17 | streaming_enrichment_job | Fichier présent 3855 bytes | ✅ Validé |
+| #18 | fraud_detection_job | Fichier présent 3930 bytes | ✅ Validé |
+| #19 | reconciliation_pipeline | DAG actif, 5 tâches, schedule */30 | ✅ Validé |
+| #20 | late_events_reprocessing | DAG actif, 3 tâches, @hourly | ✅ Validé |
