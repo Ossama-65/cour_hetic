@@ -169,3 +169,20 @@ docker logs spark-master | grep "checkpoint"
 **Comportement observé (Spark) :** ...
 
 **Données perdues :** oui / non — détails : ...
+## Incidents rencontrés — Jour 2 (02/06/2026)
+
+### INC-KFK-01 — Port PostgreSQL 5432 déjà utilisé
+**Symptôme :** Docker ne démarre pas, port 5432 occupé
+**Solution :** sudo systemctl stop postgresql
+**Statut :** Résolu
+
+### INC-KFK-02 — Disque saturé
+**Symptôme :** no space left on device au démarrage
+**Solution :** Suppression Anaconda, anciens projets, docker system prune -af
+**Statut :** Résolu
+
+### INC-KFK-03 — Airflow Scheduler unhealthy
+**Symptôme :** Scheduler affiché unhealthy dans Docker
+**Diagnostic :** airflow jobs check --job-type SchedulerJob retourne Found one alive job
+**Conclusion :** Scheduler fonctionne, problème limité au healthcheck Docker
+**Statut :** Résolu
