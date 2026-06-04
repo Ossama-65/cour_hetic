@@ -175,7 +175,7 @@ with DAG(
         return {"inserted": inserted, "rejected": rejected}
 
     @task(task_id="check_federation_stats")
-    def check_federation_stats(**context):
+    def check_federation_stats(stats: dict, **context):
         pg = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         rows = pg.get_records("""
             SELECT source_group, COUNT(*)
